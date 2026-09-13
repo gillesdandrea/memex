@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -59,23 +62,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up Boxington
+        uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          version: 1.11.0
+          cache-generation: build-v1
 
       - name: Build
-        run: cargo build --verbose
+        run: mbx build --verbose
 
       - name: Run unit and integration tests
         timeout-minutes: 10
-        run: cargo test --verbose -- --test-threads=1
+        run: mbx test --verbose -- --test-threads=1
 
   clippy:
     runs-on: ubuntu-latest
@@ -87,19 +85,14 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up Boxington
+        uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          version: 1.11.0
+          cache-generation: clippy-v1
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: mbx clippy -- -D warnings
 
   transcript-markdown-performance:
     runs-on: ubuntu-latest
@@ -109,20 +102,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Set up Boxington
+        uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-transcript-markdown-perf-${{ hashFiles('**/Cargo.lock') }}
+          version: 1.11.0
+          cache-generation: transcript-markdown-performance-v1
 
       - name: Compare transcript Markdown performance
         run: >-
-          cargo test --release --lib transcript_markdown_perf --
+          mbx test --release --lib transcript_markdown_perf --
           --ignored --nocapture --test-threads=1
 
   fmt:
