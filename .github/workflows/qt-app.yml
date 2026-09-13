@@ -1,0 +1,70 @@
+name: Qt app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/qt/**"
+      - ".github/workflows/qt-app.yml"
+  pull_request:
+    paths:
+      - "apps/qt/**"
+      - ".github/workflows/qt-app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-qt:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      MEMEX_QT_CAPTURE_DIR: ${{ runner.temp }}/memex-qt-captures
+    steps:
+      - name: Install checkout prerequisites
+        run: dnf install -y git tar gzip
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Fedora Rust and Qt dependencies
+        run: |
+          bash apps/qt/scripts/install-fedora-deps.sh
+          printf '%s\n' /usr/lib64/qt6/bin >> "$GITHUB_PATH"
+
+      - name: Set up Boxington
+        uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
+        with:
+          version: 1.11.0
+          cache-generation: qt-linux-v1
+          # Target mode assumes the root crate; Qt is a standalone nested crate.
+          github-cache-mode: objects
+
+      - name: Test native Qt app
+        run: bash apps/qt/scripts/test-container.sh
+
+      - name: Package native Qt development build
+        run: bash apps/qt/scripts/build.sh dev
+
+      - name: Upload Qt development archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: memex-qt-linux-x86_64-dev
+          path: apps/qt/build/*.tar.gz
+          if-no-files-found: error
+
+      - name: Upload Qt test screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: memex-qt-linux-x86_64-dev-screenshots
+          path: ${{ env.MEMEX_QT_CAPTURE_DIR }}
+          if-no-files-found: warn
