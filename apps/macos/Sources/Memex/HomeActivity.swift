@@ -236,21 +236,11 @@ struct HomeActivityView: View {
                 }
                 Spacer()
                 HStack(spacing: 8) {
-                    Picker("Activity metric", selection: $store.homeActivityMetric) {
-                        ForEach(HomeActivityMetric.allCases, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .fixedSize()
-                    Picker("Activity timeframe", selection: $store.filters.timeframe) {
-                        Text("24H").tag(ConversationTimeframe.day)
-                        Text("7D").tag(ConversationTimeframe.week)
-                        Text("30D").tag(ConversationTimeframe.month)
-                        Text("All").tag(ConversationTimeframe.all)
-                    }
-                    .fixedSize()
+                    ActivitySegments("Activity metric", selection: $store.homeActivityMetric,
+                        options: HomeActivityMetric.allCases.map { ($0, $0.title) })
+                    ActivitySegments("Activity timeframe", selection: $store.filters.timeframe,
+                        options: [(.day, "24H"), (.week, "7D"), (.month, "30D"), (.all, "All")])
                 }
-                .pickerStyle(.segmented)
-                .controlSize(.large)
-                .labelsHidden()
             }
             VStack(alignment: .leading, spacing: 16) {
                 if let payload = currentPayload {
@@ -564,5 +554,51 @@ private struct ActivityLoadingBar: Shape {
         let height = rect.height * fraction
         return RoundedRectangle(cornerRadius: 2).path(in: CGRect(
             x: rect.minX, y: rect.maxY - height, width: rect.width, height: height))
+    }
+}
+
+private struct ActivitySegments<Value: Hashable>: View {
+    let label: String
+    @Binding var selection: Value
+    let options: [(Value, String)]
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(_ label: String, selection: Binding<Value>, options: [(Value, String)]) {
+        self.label = label
+        self._selection = selection
+        self.options = options
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(options, id: \.0) { value, title in
+                Button { selection = value } label: {
+                    Text(title)
+                        .font(.system(size: 11, weight: selection == value ? .medium : .regular))
+                        .foregroundStyle(.primary)
+                        .frame(minWidth: 20)
+                        .padding(.horizontal, 11)
+                        .frame(height: 22)
+                        .background(selection == value ? selectedColor : .clear, in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selection == value ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(trackColor, in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(label)
+        .fixedSize()
+    }
+
+    private var trackColor: Color {
+        colorScheme == .dark ? Color(red: 53 / 255, green: 53 / 255, blue: 56 / 255)
+            : Color(red: 237 / 255, green: 237 / 255, blue: 240 / 255)
+    }
+    private var selectedColor: Color {
+        colorScheme == .dark ? Color(red: 66 / 255, green: 66 / 255, blue: 70 / 255)
+            : Color(red: 225 / 255, green: 225 / 255, blue: 228 / 255)
     }
 }
