@@ -27,7 +27,10 @@ struct BrowserToolbarTests {
         let toolbar = try #require(window.toolbar)
         let split = controller.splitView
         let content = try #require(window.contentView)
-        #expect(content.bounds.height >= 700)
+        // AppKit can constrain the requested window size to the runner's display.
+        // The full-size content must still reach the top of the actual window.
+        #expect(content.bounds.height > 0)
+        #expect(abs(content.convert(content.bounds, to: nil).maxY - window.frame.height) < 1)
         #expect(abs(split.convert(split.bounds, to: nil).maxY - content.convert(content.bounds, to: nil).maxY) < 1)
         let sidebar = try #require(split.arrangedSubviews.first)
         #expect(abs(sidebar.convert(sidebar.bounds, to: nil).maxY - content.convert(content.bounds, to: nil).maxY) < 1)
