@@ -372,6 +372,8 @@ struct HomeActivityView: View {
                         .frame(height: 12)
                         .offset(y: 188)
                     }
+                    .transition(.identity)
+                    .transaction { $0.animation = nil }
                 } else if !pendingMachines.isEmpty {
                     HomeActivityPendingBars(bars: layout.bars,
                         barWidth: layout.barWidth)
@@ -382,6 +384,8 @@ struct HomeActivityView: View {
                         .accessibilityLabel("Additional activity is loading")
                         .accessibilityValue("Waiting for \(pendingMachineLabels.joined(separator: ", "))")
                         .help("Waiting for \(pendingMachineLabels.joined(separator: ", "))\n\(loadingDetail)")
+                        .transition(.identity)
+                        .transaction { $0.animation = nil }
                 }
             }
         }
@@ -511,14 +515,14 @@ private struct HomeActivityPendingBars: View {
                     // Overlay pending activity in plot coordinates, so it never
                     // changes the numeric scale or the already-loaded marks.
                     let height = min(28, max(0, bar.baseline))
-                        * (0.225 + 0.775 * (sin(time * 1.7 + Double(index) * 2.399) + 1) / 2)
-                    RoundedRectangle(cornerRadius: 2)
+                    let fraction = 0.225 + 0.775 * (sin(time * 1.7 + Double(index) * 2.399) + 1) / 2
+                    ActivityLoadingBar(fraction: fraction)
                         .fill(.primary.opacity(0.1))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: time)
                         .frame(width: barWidth, height: height)
                         .position(x: bar.x, y: bar.baseline - height / 2)
                 }
             }
-            .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: time)
         }
     }
 }
@@ -535,17 +539,30 @@ private struct HomeActivityLoadingBars: View {
             HStack(alignment: .bottom, spacing: 0) {
                 ForEach(0..<barCount, id: \.self) { index in
                     let phase = Double(index) * 2.399
-                    let barHeight = height * (0.225 + 0.775 * (sin(time * 1.7 + phase) + 1) / 2)
-                    RoundedRectangle(cornerRadius: height < 30 ? 1 : 3)
-                        .fill(.primary.opacity(height < 30 ? 0.25 : 0.08))
-                        .frame(width: barWidth)
+                    let fraction = 0.225 + 0.775 * (sin(time * 1.7 + phase) + 1) / 2
+                    ActivityLoadingBar(fraction: fraction)
+                        .fill(.primary.opacity(0.08))
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: time)
+                        .frame(width: barWidth, height: height)
                         .frame(maxWidth: .infinity)
-                        .frame(height: barHeight)
                 }
             }
-            .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: time)
             .frame(height: height, alignment: .bottom)
         }
         .accessibilityElement(children: .ignore)
+    }
+}
+
+// Animate the fill inside a fixed bar, not the plot coordinates or layout.
+private struct ActivityLoadingBar: Shape {
+    var fraction: CGFloat
+    var animatableData: CGFloat {
+        get { fraction }
+        set { fraction = newValue }
+    }
+    func path(in rect: CGRect) -> Path {
+        let height = rect.height * fraction
+        return RoundedRectangle(cornerRadius: 2).path(in: CGRect(
+            x: rect.minX, y: rect.maxY - height, width: rect.width, height: height))
     }
 }

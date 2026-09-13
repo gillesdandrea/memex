@@ -4,6 +4,7 @@ struct HomeView: View {
     @Bindable var store: Store
     @FocusState private var searchFocused: Bool
     @State private var showingFilters = false
+    @State private var visibleSessionIDs: Set<String> = []
 
     private var filtersHighlighted: Bool { showingFilters || store.filters.isActive || store.homeProject != nil }
 
@@ -29,66 +30,71 @@ struct HomeView: View {
                 .background(.background, in: RoundedRectangle(cornerRadius: 10))
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
 
-                HStack {
-                    Text(store.query.isEmpty ? "Recent conversations" : "Matching conversations").font(.title2.weight(.semibold))
-                    if store.loadingSessions { ProgressView().controlSize(.small) }
-                    Spacer()
-                    Button { showingFilters.toggle() } label: {
-                        Image(systemName: "line.3.horizontal.decrease")
-                            .frame(width: 20, height: 20)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text(store.query.isEmpty ? "Recent conversations" : "Matching conversations").font(.title2.weight(.semibold))
+                        Spacer()
+                        Button { showingFilters.toggle() } label: {
+                            Image(systemName: "line.3.horizontal.decrease")
+                                .frame(width: 20, height: 20)
+                        }
+                        .modifier(HomeFilterButtonStyle())
+                        .foregroundStyle(filtersHighlighted ? Color.accentColor : Color.primary)
+                        .accessibilityLabel("Filter conversations")
+                        .help("Filter conversations")
+                        .popover(isPresented: $showingFilters, arrowEdge: .bottom) {
+                            ConversationFilterControls(store: store, includesProject: true) { showingFilters = false }
+                        }
                     }
-                    .modifier(HomeFilterButtonStyle())
-                    .foregroundStyle(filtersHighlighted ? Color.accentColor : Color.primary)
-                    .accessibilityLabel("Filter conversations")
-                    .help("Filter conversations")
-                    .popover(isPresented: $showingFilters, arrowEdge: .bottom) {
-                        ConversationFilterControls(store: store, includesProject: true) { showingFilters = false }
+                    if let error = store.listError {
+                        ErrorBanner(message: error) { Task { await store.loadSessions() } }
                     }
-                }
-                if let error = store.listError {
-                    ErrorBanner(message: error) { Task { await store.loadSessions() } }
-                }
-                if store.sessions.isEmpty && !store.loadingSessions {
-                    ContentUnavailableView("No conversations", systemImage: "bubble.left.and.bubble.right",
-                        description: Text("Try another search or change your filters."))
-                }
-                LazyVStack(spacing: 0) {
-                    ForEach(store.sessions) { session in
-                        Button { store.openConversation(session) } label: {
-                            VStack(alignment: .leading, spacing: 7) {
-                                HStack(alignment: .firstTextBaseline) {
-                                    Text(session.title).font(.headline).lineLimit(1)
-                                    Spacer()
-                                    if let date = session.date {
-                                        TimelineView(.periodic(from: .now, by: 60)) { context in
-                                            Text(homeRelativeTimestamp(date, now: context.date))
-                                                .font(.caption).foregroundStyle(.secondary)
+                    if store.sessions.isEmpty && !store.loadingSessions {
+                        ContentUnavailableView("No conversations", systemImage: "bubble.left.and.bubble.right",
+                            description: Text("Try another search or change your filters."))
+                    }
+                    LazyVStack(spacing: 0) {
+                        ForEach(store.sessions) { session in
+                            Button { store.openConversation(session) } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(alignment: .firstTextBaseline) {
+                                        Text(session.title).font(.headline).lineLimit(1)
+                                        Spacer()
+                                        if let date = session.date {
+                                            TimelineView(.periodic(from: .now, by: 60)) { context in
+                                                Text(homeRelativeTimestamp(date, now: context.date))
+                                                    .font(.caption).foregroundStyle(.secondary)
+                                            }
                                         }
                                     }
-                                }
-                                HStack(spacing: 6) {
-                                    Text([session.projectName, session.source, session.machineID].joined(separator: " · "))
-                                    if session.isSubagent {
-                                        Text("·")
-                                        Text("Subagent")
+                                    HStack(spacing: 6) {
+                                        Text([session.projectName, session.source, session.machineID].joined(separator: " · "))
+                                        if session.isSubagent {
+                                            Text("·")
+                                            Text("Subagent")
+                                        }
+                                    }
+                                    .font(.caption).foregroundStyle(.secondary)
+                                    if let snippet = session.snippet?.nilIfBlank {
+                                        Text(snippet).font(.callout).foregroundStyle(.secondary).lineLimit(2)
                                     }
                                 }
-                                .font(.caption).foregroundStyle(.secondary)
-                                if let snippet = session.snippet?.nilIfBlank {
-                                    Text(snippet).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 8)
+                                .contentShape(Rectangle())
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 14).padding(.horizontal, 12)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .onAppear {
+                                visibleSessionIDs.insert(session.id)
+                                loadNextPageIfNeeded()
+                            }
+                            .onDisappear { visibleSessionIDs.remove(session.id) }
                         }
-                        .buttonStyle(.plain)
-                        Divider()
-                    }
-                    if store.hasMoreSessions {
-                        Button("Load more conversations") {
-                            if let last = store.sessions.last { store.loadMoreSessionsIfNeeded(visibleID: last.id) }
-                        }.padding().disabled(store.loadingSessions)
+                        if store.loadingSessions {
+                            ForEach(0..<(store.sessions.isEmpty ? 6 : 2), id: \.self) { index in
+                                HomeConversationSkeletonRow(index: index)
+                            }
+                        }
                     }
                 }
             }
@@ -98,6 +104,9 @@ struct HomeView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { searchFocused = true }
+        .onChange(of: store.loadingSessions) { _, loading in
+            if !loading { loadNextPageIfNeeded() }
+        }
         .task {
             while !Task.isCancelled {
                 await refreshIfVisible()
@@ -113,10 +122,45 @@ struct HomeView: View {
         }
     }
 
+    private func loadNextPageIfNeeded() {
+        guard store.listError == nil,
+              let visible = store.sessions.suffix(5).first(where: { visibleSessionIDs.contains($0.id) }) else { return }
+        store.loadMoreSessionsIfNeeded(visibleID: visible.id)
+    }
+
     private func refreshIfVisible() async {
         let window = NSApplication.shared.mainWindow
         await store.refreshHomeIfStale(isVisible: NSApplication.shared.isActive
             && window?.isVisible == true && window?.isMiniaturized == false)
+    }
+}
+
+private struct HomeConversationSkeletonRow: View {
+    let index: Int
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.8)) { context in
+            let time = reduceMotion ? 0 : context.date.timeIntervalSinceReferenceDate
+            GeometryReader { geometry in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        RoundedRectangle(cornerRadius: 3)
+                            .frame(width: geometry.size.width * [0.46, 0.34, 0.55][index % 3], height: 14)
+                        Spacer()
+                        RoundedRectangle(cornerRadius: 3).frame(width: 56, height: 10)
+                    }
+                    RoundedRectangle(cornerRadius: 3)
+                        .frame(width: geometry.size.width * 0.25, height: 10)
+                }
+                .foregroundStyle(.primary.opacity(0.06 + 0.04 * (sin(time * 1.7 + Double(index)) + 1) / 2))
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.8), value: time)
+            }
+            .frame(height: 33)
+            .padding(.vertical, 8)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading conversations")
     }
 }
 

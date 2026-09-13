@@ -8,8 +8,8 @@ import Testing
         let cell = ConversationCell()
         for (machine, kind, expected) in [
             ("local", "subagent", "Subagent"),
-            ("nicbook-atm", "subagent", "▣ nicbook-atm · Subagent"),
-            ("nicbook-atm", "main", "▣ nicbook-atm"),
+            ("nicbook-atm", "subagent", "nicbook-atm · Subagent"),
+            ("nicbook-atm", "main", "nicbook-atm"),
             ("local", "main", "")
         ] {
             let session = Session(source: "codex", sessionID: "s", sourcePath: "/s", project: "memex",
@@ -20,6 +20,10 @@ import Testing
             cell.configure(controller.rows[0])
             cell.layoutSubtreeIfNeeded()
             let visibleLabels = cell.subviews.compactMap { $0 as? NSTextField }.filter { !$0.isHidden }
+            let icon = try #require(cell.subviews.compactMap { $0 as? NSImageView }.first)
+            #expect(icon.image != nil)
+            #expect(icon.isHidden == (machine == "local"))
+            if !icon.isHidden { #expect(icon.frame.maxY <= height) }
             #expect(visibleLabels.allSatisfy { $0.frame.maxY <= height })
             if expected.isEmpty {
                 #expect(!visibleLabels.contains { $0.stringValue.contains("nicbook-atm") || $0.stringValue.contains("Subagent") })

@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Testing
 @testable import Memex
 
@@ -33,9 +34,9 @@ private struct PagingFixture {
         client = MemexClient(executable: executable)
         let formatter = ISO8601DateFormatter()
         for machine in ["local", "peer"] {
-            for limit in [200, 400] {
+            for limit in [200, 400, 600] {
                 for project in ["memex", "other"] {
-                    let rows: [[String: Any]] = (0..<limit).map { index in
+                    let rows: [[String: Any]] = (0..<min(limit, 450)).map { index in
                         let timestamp = Date(timeIntervalSince1970: 1_789_000_000 - Double(index * 2 + (machine == "peer" ? 1 : 0)))
                         return ["source": "codex", "session_id": "\(project)-\(index)", "source_path": "/\(project)/\(index)",
                                 "project": project, "machine": machine, "label": "Page \(limit)",
@@ -59,7 +60,54 @@ private struct PagingFixture {
     try #require(store.sessions.contains { $0.machineID == "local" && $0.label == "Page 400" && $0.project == project })
 }
 
+private struct PagingHome: View {
+    @Bindable var store: Store
+    var body: some View {
+        HomeView(store: store).task(id: store.requestID) { await store.loadSessions() }
+    }
+}
+
 @MainActor @Suite(.serialized) struct StorePagingTests {
+    @Test func homeScrollLoadsPagesAndStopsAtTheEnd() async throws {
+        let fixture = try PagingFixture()
+        defer { fixture.cleanUp() }
+        let store = Store(client: fixture.client)
+        store.machines = [.local]
+        await store.loadSessions()
+        let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1000, height: 700),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.alphaValue = 0
+        window.contentViewController = NSHostingController(rootView: PagingHome(store: store))
+        window.setContentSize(NSSize(width: 1000, height: 700))
+        window.orderBack(nil)
+        defer { window.close() }
+        func scrollView(in view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView { return scroll }
+            return view.subviews.lazy.compactMap { scrollView(in: $0) }.first
+        }
+        window.contentView?.layoutSubtreeIfNeeded()
+        let content = try #require(window.contentView)
+        let scroll = try #require(scrollView(in: content))
+        #expect(scroll.contentView.bounds.height > 0)
+        for expectedCount in [400, 450] {
+            let deadline = Date().addingTimeInterval(15)
+            while (store.sessions.count < expectedCount || store.loadingSessions), Date() < deadline {
+                window.contentView?.layoutSubtreeIfNeeded()
+                let bottom = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            // The next page may finish before the scroll loop observes this one.
+            #expect(store.sessions.count >= expectedCount)
+        }
+        #expect(store.sessions.count == 450)
+        #expect(!store.hasMoreSessions)
+        #expect(store.sessionLimit == 600)
+        #expect(Set(store.sessions.map(\.id)).count == 450)
+    }
+
     @Test func delayedPeerPagePreservesVisibleRemoteRowAndNativeScrollAnchor() async throws {
         let fixture = try PagingFixture()
         defer { fixture.cleanUp() }

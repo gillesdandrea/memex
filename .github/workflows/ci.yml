@@ -12,6 +12,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-app:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build macOS app
+        run: swift build --package-path apps/macos --product Memex --force-resolved-versions
+
+      - name: Test macOS app
+        timeout-minutes: 10
+        # AppKit tests share process-wide window and application state.
+        run: swift test --package-path apps/macos --force-resolved-versions --no-parallel
+
   release-scripts:
     runs-on: ubuntu-latest
     steps:

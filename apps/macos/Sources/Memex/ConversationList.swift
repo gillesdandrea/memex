@@ -29,7 +29,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
             title = session.title
             preview = session.snippet?.nilIfBlank ?? session.source
             date = session.date?.formatted(.dateTime.month(.abbreviated).day()) ?? ""
-            metadata = [session.machineID == "local" ? nil : "▣ \(session.machineID)",
+            metadata = [session.machineID == "local" ? nil : session.machineID,
                         session.isSubagent ? "Subagent" : nil]
                 .compactMap { $0 }.joined(separator: " · ").nilIfBlank
         }
@@ -138,6 +138,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
     private let title = NSTextField(wrappingLabelWithString: "")
     private let preview = NSTextField(wrappingLabelWithString: "")
     private let metadata = NSTextField(labelWithString: "")
+    private let machineIcon = NSImageView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -160,6 +161,10 @@ struct NativeConversationList: NSViewControllerRepresentable {
         title.maximumNumberOfLines = 1
         preview.maximumNumberOfLines = 1
         date.alignment = .right
+        machineIcon.image = NSImage(systemSymbolName: "network", accessibilityDescription: "Remote machine")
+        machineIcon.contentTintColor = .secondaryLabelColor
+        machineIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        addSubview(machineIcon)
         setAccessibilityElement(true)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -171,6 +176,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
         preview.stringValue = row.preview
         metadata.stringValue = row.metadata ?? ""
         metadata.isHidden = row.metadata == nil
+        machineIcon.isHidden = row.session.machineID == "local"
         setAccessibilityLabel([row.project, row.date, row.title, row.preview, row.metadata].compactMap { $0 }.joined(separator: ", "))
         needsLayout = true
     }
@@ -182,6 +188,8 @@ struct NativeConversationList: NSViewControllerRepresentable {
         date.frame = NSRect(x: 8 + width - dateWidth, y: 8, width: dateWidth, height: 15)
         title.frame = NSRect(x: 8, y: 25, width: width, height: 17)
         preview.frame = NSRect(x: 8, y: 43, width: width, height: 16)
-        metadata.frame = NSRect(x: 8, y: 61, width: width, height: 15)
+        machineIcon.frame = NSRect(x: 8, y: 62, width: 12, height: 12)
+        let iconWidth: CGFloat = machineIcon.isHidden ? 0 : 16
+        metadata.frame = NSRect(x: 8 + iconWidth, y: 61, width: max(0, width - iconWidth), height: 15)
     }
 }
