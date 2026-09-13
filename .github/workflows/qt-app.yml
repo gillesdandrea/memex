@@ -25,7 +25,6 @@ jobs:
         shell: bash
     env:
       CARGO_TERM_COLOR: always
-      MEMEX_QT_CAPTURE_DIR: ${{ runner.temp }}/memex-qt-captures
     steps:
       - name: Install checkout prerequisites
         run: dnf install -y git tar gzip
@@ -49,6 +48,8 @@ jobs:
           github-cache-mode: objects
 
       - name: Test native Qt app
+        env:
+          MEMEX_QT_CAPTURE_DIR: ${{ runner.temp }}/memex-qt-captures
         run: bash apps/qt/scripts/test-container.sh
 
       - name: Package native Qt development build
@@ -66,5 +67,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: memex-qt-linux-x86_64-dev-screenshots
-          path: ${{ env.MEMEX_QT_CAPTURE_DIR }}
+          path: ${{ runner.temp }}/memex-qt-captures
           if-no-files-found: warn
