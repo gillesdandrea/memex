@@ -53,7 +53,19 @@ final class Store {
     var loadingSessions = false
     var loadingHomeActivity = false
     var homeActivityMetric = HomeActivityMetric.sessions
-    var homeActivityCache: HomeActivityCache?
+    var homeActivityCache: HomeActivityCache? {
+        didSet {
+            guard let cache = homeActivityCache else { return }
+            homeActivityCaches[cache.criteria] = cache
+            homeActivityCacheOrder.removeAll { $0 == cache.criteria }
+            homeActivityCacheOrder.append(cache.criteria)
+            while homeActivityCacheOrder.count > 8 {
+                homeActivityCaches.removeValue(forKey: homeActivityCacheOrder.removeFirst())
+            }
+        }
+    }
+    private var homeActivityCaches: [String: HomeActivityCache] = [:]
+    private var homeActivityCacheOrder: [String] = []
     var homeActivityGeneration = UUID()
     private var refreshingHome = false
     private var lastHomeRefresh = Date()
@@ -119,6 +131,9 @@ final class Store {
     var sessionCountRequestID: String { "\(sessionCriteriaID)|\(countRefresh)" }
     var homeActivityCriteriaID: String { sessionCriteriaID }
     var homeActivityRequestID: String { "\(sessionCriteriaID)|\(activityRefresh)" }
+    func cachedHomeActivity(for criteria: String) -> HomeActivityCache? {
+        homeActivityCaches[criteria]
+    }
     var sessionTotal: Int? {
         guard countResultKey == sessionCountRequestID, let countValue,
               countValue >= sessions.count else { return nil }

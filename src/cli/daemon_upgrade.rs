@@ -305,6 +305,23 @@ fn replace_program(contents: &str, exe: &Path, macos: bool) -> Result<String> {
     Ok(format!("{}{}{}", &contents[..start], new, &contents[end..]))
 }
 
+fn upgrade_launchd_scheduling(contents: String) -> String {
+    // Migrate only our former default. Preserve explicitly configured policies
+    // and interval-only indexing jobs.
+    if contents.contains("<key>ProcessType</key>")
+        || !contents
+            .split_once("<key>KeepAlive</key>")
+            .is_some_and(|(_, value)| value.trim_start().starts_with("<true/>"))
+    {
+        return contents;
+    }
+    contents.replacen(
+        "<key>ProgramArguments</key>",
+        "<key>ProcessType</key>\n  <string>Interactive</string>\n  <key>ProgramArguments</key>",
+        1,
+    )
+}
+
 pub(super) fn reconcile(root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
@@ -394,6 +411,11 @@ pub(super) fn reconcile(root: Option<PathBuf>) -> Result<()> {
     }
     let exe = service_executable()?;
     let updated = replace_program(&contents, &exe, macos)?;
+    let updated = if macos {
+        upgrade_launchd_scheduling(updated)
+    } else {
+        updated
+    };
     if updated == contents
         && continuous
         && let Some(info) = crate::daemon_runtime::read(&paths)?
@@ -408,8 +430,8 @@ pub(super) fn reconcile(root: Option<PathBuf>) -> Result<()> {
         }
         return Ok(());
     }
-    // Only the executable changes: preserve every existing argument, root,
-    // environment variable, listener and scheduling setting exactly.
+    // Preserve every existing argument, root, environment variable and listener.
+    // Continuous launchd jobs also adopt interactive scheduling when unset.
     let mut staged = tempfile::NamedTempFile::new_in(
         definition
             .parent()
@@ -453,6 +475,34 @@ pub(super) fn reconcile(root: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuous_launchd_jobs_get_interactive_scheduling() {
+        let args = vec![
+            "/usr/local/bin/memex".into(),
+            "index".into(),
+            "--watch".into(),
+        ];
+        let policy = "  <key>ProcessType</key>\n  <string>Interactive</string>\n";
+        let continuous = build_launchd_plist("custom", &args, None, true, None, None, &[]);
+        assert!(continuous.contains(policy));
+        let old = continuous.replace(policy, "");
+        let updated = upgrade_launchd_scheduling(old.clone());
+        assert!(updated.contains("<string>Interactive</string>"));
+        assert_eq!(upgrade_launchd_scheduling(updated.clone()), updated);
+        let interval = build_launchd_plist("custom", &args, Some(600), false, None, None, &[]);
+        assert!(!interval.contains("<key>ProcessType</key>"));
+        assert_eq!(upgrade_launchd_scheduling(interval.clone()), interval);
+        for explicit in ["Background", "Standard", "Adaptive", "Interactive"] {
+            let configured = continuous.replace("Interactive", explicit);
+            assert_eq!(upgrade_launchd_scheduling(configured.clone()), configured);
+        }
+        let stopped = old.replace(
+            "<key>KeepAlive</key>\n  <true/>",
+            "<key>KeepAlive</key>\n  <false/>",
+        );
+        assert_eq!(upgrade_launchd_scheduling(stopped.clone()), stopped);
+    }
+
     #[test]
     fn observation_keeps_profile_and_manual_links_that_advanced_during_startup() {
         let profile = Path::new("/home/me/.nix-profile/bin/memex");

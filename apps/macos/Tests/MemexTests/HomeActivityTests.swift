@@ -1,6 +1,72 @@
 import Foundation
 import Testing
+import SwiftUI
 @testable import Memex
+
+@Test func homeActivityStatusUsesOneMessageForIncompleteResults() {
+    let payload = HomeActivityPayload(metric: "tokens", bucketKeys: [], tokenUsageEnabled: true,
+        partial: true, points: [])
+    #expect(homeActivityStatus(payload: payload, remainingMachines: 0,
+        failedMachines: ["local": "Request timed out"], refreshError: nil)
+        == "Some activity is unavailable.")
+    #expect(homeActivityStatus(payload: payload, remainingMachines: 1,
+        failedMachines: ["local": "Request timed out"], refreshError: nil)
+        == "Some activity is unavailable.")
+    #expect(homeActivityStatus(payload: payload, remainingMachines: 0,
+        failedMachines: [:], refreshError: nil) == "Some activity is unavailable.")
+    #expect(homeActivityStatus(payload: payload, remainingMachines: 1,
+        failedMachines: [:], refreshError: nil) == nil)
+    let complete = HomeActivityPayload(metric: "tokens", bucketKeys: [], tokenUsageEnabled: true,
+        partial: false, points: [])
+    #expect(homeActivityStatus(payload: complete, remainingMachines: 0,
+        failedMachines: [:], refreshError: nil) == nil)
+    #expect(homeActivityStatus(payload: complete, remainingMachines: 0,
+        failedMachines: [:], refreshError: "Request timed out") == "Some activity is unavailable.")
+    let disabled = HomeActivityPayload(metric: "tokens", bucketKeys: [], tokenUsageEnabled: false,
+        partial: false, points: [])
+    #expect(homeActivityStatus(payload: disabled, remainingMachines: 0,
+        failedMachines: [:], refreshError: nil) == "Some activity is unavailable.")
+    let warning = HomeActivityPayload(metric: "tokens", bucketKeys: [], tokenUsageEnabled: true,
+        partial: false, points: [], warnings: ["A provider could not be read"])
+    #expect(homeActivityStatus(payload: warning, remainingMachines: 0,
+        failedMachines: [:], refreshError: nil) == "Some activity is unavailable.")
+}
+
+@Test @MainActor func homeActivityCacheRetainsOnlyEightRecentSelections() {
+    let store = Store()
+    for index in 0..<9 {
+        store.homeActivityCache = HomeActivityCache(criteria: "selection-\(index)", request: "request-\(index)",
+            payload: HomeActivityPayload(metric: "sessions", bucketKeys: [], tokenUsageEnabled: true, partial: false, points: []),
+            machines: [:], failures: [:], complete: true, updatedAt: Date())
+    }
+    #expect(store.cachedHomeActivity(for: "selection-0") == nil)
+    #expect(store.cachedHomeActivity(for: "selection-1") != nil)
+    #expect(store.cachedHomeActivity(for: "selection-8") != nil)
+    store.homeActivityCache = store.cachedHomeActivity(for: "selection-1")
+    #expect(store.homeActivityCache?.request == "request-1")
+    store.homeActivityCache = nil
+    #expect(store.cachedHomeActivity(for: "selection-1") != nil)
+}
+
+@Test @MainActor func homeActivityWithNoMachinesFinishesWithoutLoadingForever() async throws {
+    _ = NSApplication.shared
+    let store = Store()
+    store.machines = []
+    let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 900, height: 400),
+        styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.alphaValue = 0
+    window.contentViewController = NSHostingController(rootView: HomeActivityView(store: store))
+    window.orderBack(nil)
+    defer { window.close() }
+    let deadline = Date().addingTimeInterval(3)
+    while store.homeActivityCache == nil && Date() < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(store.homeActivityCache?.complete == true)
+    #expect(store.homeActivityCache?.payload.points.isEmpty == true)
+    #expect(!store.loadingHomeActivity)
+}
 
 @Test func homeActivityCacheReusesOnlyCompletedCurrentRequests() {
     let now = Date()
@@ -69,7 +135,8 @@ import Testing
     #expect(merged.partial)
 }
 
-@Test @MainActor func homeActivityPublishesFastMachineBeforeSlowMachineCompletes() async throws {
+@Test(arguments: [false, true]) @MainActor
+func homeActivityPublishesFastMachineBeforeSlowMachineCompletes(localIsSlow: Bool) async throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -85,7 +152,7 @@ import Testing
       fi
       shift
     done
-    if [ "$machine" = "slow-peer" ]; then
+    if [ "$machine" = "$(cat "$fixture_dir/slow-machine")" ]; then
       attempts=0
       while [ ! -f "$fixture_dir/release" ] && [ "$attempts" -lt 200 ]; do
         sleep 0.01
@@ -97,13 +164,28 @@ import Testing
     """#
     try script.write(to: executable, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    let slowMachine = localIsSlow ? "local" : "remote-peer"
+    let fastMachine = localIsSlow ? "remote-peer" : "local"
+    try slowMachine.write(to: directory.appendingPathComponent("slow-machine"), atomically: true, encoding: .utf8)
     let selection = HomeActivitySelection(metric: "sessions", timeframe: .all, query: nil,
         project: nil, source: nil, origin: .all, nowMS: 172_800_000)
     var batches: [HomeActivityBatch] = []
-    try await MemexClient(executable: executable).activityBatches(selection, machines: ["local", "slow-peer"]) { batch in
+    try await MemexClient(executable: executable).activityBatches(selection, machines: ["local", "remote-peer"]) { batch in
         batches.append(batch)
-        if batch.machine == "local" { FileManager.default.createFile(atPath: directory.appendingPathComponent("release").path, contents: nil) }
+        if batch.machine == fastMachine { FileManager.default.createFile(atPath: directory.appendingPathComponent("release").path, contents: nil) }
     }
-    #expect(batches.map(\.machine) == ["local", "slow-peer"])
+    #expect(batches.map(\.machine) == [fastMachine, slowMachine])
     #expect(batches.allSatisfy { $0.error == nil && $0.payload != nil })
+}
+
+@Test func homeActivitySkeletonMatchesRollingRangeBuckets() {
+    for timeframe in [ConversationTimeframe.day, .week, .month] {
+        let selection = HomeActivitySelection(metric: "sessions", timeframe: timeframe, query: nil,
+            project: nil, source: nil, origin: .all, nowMS: 1_800_000_000_000)
+        let payload = HomeActivityPayload.merge([], selection: selection, failed: false)
+        let skeleton = HomeActivityPayload.skeleton(metric: .sessions, timeframe: timeframe, nowMS: selection.nowMS)
+        #expect(skeleton.bucketKeys == payload.bucketKeys)
+        #expect(skeleton.points.map(\.date) == payload.bucketKeys)
+    }
+    #expect(HomeActivityPayload.skeleton(metric: .sessions, timeframe: .all, nowMS: 1_800_000_000_000).bucketKeys.count == 60)
 }

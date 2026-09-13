@@ -7103,6 +7103,9 @@ fn build_launchd_plist(
     if keep_alive {
         out.push_str("  <key>KeepAlive</key>\n");
         out.push_str("  <true/>\n");
+        // Continuous indexing also serves the native app socket. Its ordinary
+        // Unix-socket requests cannot trigger Adaptive's XPC promotion.
+        out.push_str("  <key>ProcessType</key>\n  <string>Interactive</string>\n");
     }
 
     if let Some(stdout) = stdout {

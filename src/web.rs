@@ -618,7 +618,23 @@ pub(crate) fn raw_activity_payload(
 
     let mut warnings = Vec::new();
     let partial = match (params.metric, matching_scopes.as_ref()) {
-        (ActivityMetric::Sessions, matching_scopes) => {
+        (ActivityMetric::Sessions, None) => {
+            // Charts only need timestamps. Catalog rows also resolve current
+            // provider titles, which can scan every matching transcript.
+            let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+            for (source, timestamp) in store.query_source_timestamps_filtered(
+                params.source,
+                since_ms,
+                None,
+                params.project.as_deref(),
+                ProjectGrouping::Flat,
+                Some(params.origin),
+            )? {
+                add_activity_value(&mut buckets, timestamp, source.label(), 1, bucket_ms);
+            }
+            false
+        }
+        (ActivityMetric::Sessions, Some(matching_scopes)) => {
             let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
             for session in store.query_sessions_filtered(
                 params.source,
@@ -628,13 +644,11 @@ pub(crate) fn raw_activity_payload(
                 Some(params.origin),
                 None,
             )? {
-                if matching_scopes.is_some_and(|scopes| {
-                    !scopes.contains(&(
-                        session.source.storage_label().to_string(),
-                        session.session_id.clone(),
-                        session.source_path.clone(),
-                    ))
-                }) {
+                if !matching_scopes.contains(&(
+                    session.source.storage_label().to_string(),
+                    session.session_id.clone(),
+                    session.source_path.clone(),
+                )) {
                     continue;
                 }
                 add_activity_value(
@@ -2543,6 +2557,60 @@ mod tests {
             let error = session_payload(&paths, &request(&selector)).unwrap_err();
             assert!(error.downcast_ref::<InvalidSessionOffset>().is_some());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_session_activity_does_not_open_transcripts() {
+        use crate::analytics::AnalyticsWriter;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        let mut row = record(1, "session", transcript.to_str().unwrap(), "hello".into());
+        row.ts = 86_400_000;
+        let mut writer = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        writer.record(&row).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // A title lookup would block opening this transcript. The indexed
+        // timestamp and source are sufficient to produce session activity.
+        let path = std::ffi::CString::new(transcript.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let request = ActivityRequest::from_url(
+            &parse_url("/api/activity?range=all&origin=regular&project=memex&source=claude")
+                .unwrap(),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = single_machine_activity_payload(&paths, &request, "local", 172_800_000);
+            let _ = sender.send(result);
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        // Release an accidental transcript open before reporting the failure,
+        // so a regression cannot leave a blocked test thread behind.
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&transcript)
+            .unwrap();
+        // Future opens must also complete if the worker was merely delayed.
+        std::fs::remove_file(&transcript).unwrap();
+        std::fs::write(&transcript, b"").unwrap();
+        drop(release);
+        worker.join().unwrap();
+        let activity = result
+            .expect("session activity attempted to read a transcript")
+            .unwrap();
+        assert_eq!(activity.points.len(), 1);
+        assert_eq!(activity.points[0].timestamp_ms, 86_400_000);
+        assert_eq!(activity.points[0].source, "claude");
+        assert_eq!(activity.points[0].value, 1);
+        assert!(!activity.partial);
     }
 
     #[test]

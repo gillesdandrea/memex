@@ -5,6 +5,21 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct HomeTests {
+    @Test func relativeTimestampsUseWholeMinutesAndHours() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(30), now: now) == "Just now")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-59), now: now) == "Just now")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-60), now: now) == "1 min ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-199), now: now) == "3 min ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-3599), now: now) == "59 min ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-3600), now: now) == "1 hr ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-86399), now: now) == "23 hr ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-86400), now: now) == "1d ago")
+        #expect(homeRelativeTimestamp(now.addingTimeInterval(-604799), now: now) == "6d ago")
+        let older = now.addingTimeInterval(-604800)
+        #expect(homeRelativeTimestamp(older, now: now) == older.formatted(.dateTime.month(.abbreviated).day().year()))
+    }
+
     @Test func automaticRefreshWaitsForStalenessAndVisibilityAndRetainsResults() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -127,6 +142,27 @@ struct HomeTests {
         #expect(requests.filter { $0 == "projects" }.count == 1)
         #expect(requests.filter { $0 == "sessions" }.count == 2) // list and count
         #expect(requests.filter { $0 == "activity" }.count == 1) // Returning to fresh Home reuses its chart.
+
+        store.scope = .home
+        let originalTimeframe = store.filters.timeframe
+        for (metric, timeframe) in [(HomeActivityMetric.tokens, originalTimeframe),
+                                    (.sessions, .day), (.sessions, originalTimeframe),
+                                    (.tokens, originalTimeframe)] {
+            store.homeActivityMetric = metric
+            store.filters.timeframe = timeframe
+            let criteria = "\(store.homeActivityCriteriaID)|\(metric)"
+            let deadline = Date().addingTimeInterval(15)
+            repeat {
+                try await Task.sleep(for: .milliseconds(20))
+            } while (store.homeActivityCache?.criteria != criteria || store.homeActivityCache?.complete != true
+                     || store.loadingHomeActivity) && Date() < deadline
+            #expect(store.homeActivityCache?.criteria == criteria)
+            #expect(store.homeActivityCache?.complete == true)
+            #expect(!store.loadingHomeActivity)
+        }
+        let afterSwitching = try String(contentsOf: directory.appendingPathComponent("requests"), encoding: .utf8)
+            .split(separator: "\n")
+        #expect(afterSwitching.filter { $0 == "activity" }.count == 3)
     }
 
     @Test func launchStartsAtHomeAndOpeningResultPreservesCriteria() {

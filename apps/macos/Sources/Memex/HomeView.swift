@@ -60,7 +60,10 @@ struct HomeView: View {
                                     Text(session.title).font(.headline).lineLimit(1)
                                     Spacer()
                                     if let date = session.date {
-                                        Text(date, style: .relative).font(.caption).foregroundStyle(.secondary)
+                                        TimelineView(.periodic(from: .now, by: 60)) { context in
+                                            Text(homeRelativeTimestamp(date, now: context.date))
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
                                     }
                                 }
                                 HStack(spacing: 6) {
@@ -114,6 +117,17 @@ struct HomeView: View {
         let window = NSApplication.shared.mainWindow
         await store.refreshHomeIfStale(isVisible: NSApplication.shared.isActive
             && window?.isVisible == true && window?.isMiniaturized == false)
+    }
+}
+
+func homeRelativeTimestamp(_ date: Date, now: Date) -> String {
+    let elapsed = max(0, now.timeIntervalSince(date))
+    switch elapsed {
+    case ..<60: return "Just now"
+    case ..<3600: return "\(Int(elapsed / 60)) min ago"
+    case ..<86400: return "\(Int(elapsed / 3600)) hr ago"
+    case ..<604800: return "\(Int(elapsed / 86400))d ago"
+    default: return date.formatted(.dateTime.month(.abbreviated).day().year())
     }
 }
 
