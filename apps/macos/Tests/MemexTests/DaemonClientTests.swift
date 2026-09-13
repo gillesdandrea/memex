@@ -40,7 +40,8 @@ private final class SocketFixture: @unchecked Sendable {
             throw ClientError(message: "socket fixture bind failed")
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: socketURL.path)
-        Task.detached { [self] in acceptConnections() }
+        // Blocking fixture sockets must not occupy Swift's cooperative workers.
+        Thread.detachNewThread { [self] in acceptConnections() }
     }
 
     var client: MemexClient { MemexClient(executable: executable, root: root.path, daemonSocket: socketURL) }
@@ -73,7 +74,7 @@ private final class SocketFixture: @unchecked Sendable {
             var enabled: Int32 = 1
             _ = setsockopt(child, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout.size(ofValue: enabled)))
             lock.withLock { connections += 1; _ = children.insert(child) }
-            Task.detached { [self] in serve(child) }
+            Thread.detachNewThread { [self] in serve(child) }
         }
     }
     private func serve(_ child: Int32) {

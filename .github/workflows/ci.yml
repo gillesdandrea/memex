@@ -29,30 +29,7 @@ jobs:
       - name: Test macOS app
         timeout-minutes: 10
         # AppKit tests share process-wide window and application state.
-        run: |
-          mkdir -p /tmp/memex-test-diagnostics
-          NSUnbufferedIO=YES swift test --verbose --package-path apps/macos --force-resolved-versions --no-parallel > /tmp/memex-test-diagnostics/tests.log 2>&1 &
-          test_pid=$!
-          (
-            sleep 150
-            ps -axo pid,ppid,etime,command > /tmp/memex-test-diagnostics/processes.txt
-            for pid in $(pgrep -f 'xctest|swiftpm-testing-helper'); do
-              sample "$pid" 3 -file "/tmp/memex-test-diagnostics/sample-$pid.txt" || true
-            done
-            kill -TERM "$test_pid"
-          ) &
-          watchdog_pid=$!
-          result=0
-          wait "$test_pid" || result=$?
-          kill "$watchdog_pid" 2>/dev/null || true
-          cat /tmp/memex-test-diagnostics/tests.log
-          exit "$result"
-
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: macos-test-diagnostics
-          path: /tmp/memex-test-diagnostics
+        run: swift test --package-path apps/macos --force-resolved-versions --no-parallel
 
   release-scripts:
     runs-on: ubuntu-latest
