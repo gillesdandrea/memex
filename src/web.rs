@@ -2,7 +2,7 @@ use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analy
 use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey, TimestampOrder};
 use crate::types::SourceFilter;
-use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity_with_warnings};
+use crate::usage::{CostMode, UsageQuery, scan_usage, visit_usage_activity};
 use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -770,10 +770,7 @@ pub(crate) fn raw_activity_payload(
                 cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                 memo_ttl_ms: 60_000,
             };
-            let (points, scan_warnings) = scan_usage_activity_with_warnings(&query)?;
-            let partial = !scan_warnings.is_empty();
-            warnings.extend(scan_warnings);
-            for point in points {
+            let scan_warnings = visit_usage_activity(&query, |point| {
                 add_activity_value(
                     &mut buckets,
                     point.timestamp_ms,
@@ -781,7 +778,9 @@ pub(crate) fn raw_activity_payload(
                     point.total_tokens,
                     bucket_ms,
                 );
-            }
+            })?;
+            let partial = !scan_warnings.is_empty();
+            warnings.extend(scan_warnings);
             partial
         }
     };

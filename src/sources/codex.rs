@@ -1631,7 +1631,15 @@ pub(crate) fn parse_usage_file(
 }
 
 pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
-    let mut seen = HashSet::new();
+    let eligible_count = events
+        .iter()
+        .filter(|event| {
+            event.source == "codex"
+                && event.session_id.is_some()
+                && event.source_record_id.is_some()
+        })
+        .count();
+    let mut seen = HashSet::with_capacity(eligible_count);
     events.retain(|event| {
         if event.source != "codex" {
             return true;

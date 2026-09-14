@@ -1,0 +1,362 @@
+//! Retained usage events use dictionary IDs instead of separately allocated strings.
+//! Parsing and reconciliation still operate on owned events. Reports borrow text from
+//! this assembly; only callers requesting detailed events allocate owned strings again.
+
+use super::{UsageActivityPoint, UsageEvent, UsageEventData};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+pub(super) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct StringId(NonZeroUsize);
+
+pub(super) enum UsageAssembly {
+    Owned(Vec<UsageEvent>),
+    Compact(CompactUsageAssembly),
+}
+
+pub(super) struct FilterFields<'a> {
+    pub source: &'static str,
+    pub timestamp_ms: u64,
+    pub permission_review: bool,
+    pub project: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+
+impl UsageAssembly {
+    pub fn new(events: Vec<UsageEvent>, previous: Option<Self>) -> Self {
+        let previous = match previous {
+            Some(Self::Compact(assembly)) => Some(assembly),
+            _ => None,
+        };
+        Self::Compact(CompactUsageAssembly::new(events, previous))
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(events) => events.len(),
+            Self::Compact(assembly) => assembly.events.len(),
+        }
+    }
+
+    pub fn filter_fields(&self, index: usize) -> FilterFields<'_> {
+        match self {
+            Self::Owned(events) => {
+                let event = &events[index];
+                FilterFields {
+                    source: event.source,
+                    timestamp_ms: event.timestamp_ms,
+                    permission_review: event.permission_review,
+                    project: event.project.as_deref(),
+                    session_id: event.session_id.as_deref(),
+                }
+            }
+            Self::Compact(assembly) => {
+                let event = &assembly.events[index];
+                FilterFields {
+                    source: event.source,
+                    timestamp_ms: event.timestamp_ms,
+                    permission_review: event.permission_review,
+                    project: event.project.map(|id| assembly.text(id)),
+                    session_id: event.session_id.map(|id| assembly.text(id)),
+                }
+            }
+        }
+    }
+
+    pub fn activity_point(&self, index: usize) -> UsageActivityPoint {
+        match self {
+            Self::Owned(events) => events[index].activity_point(),
+            Self::Compact(assembly) => assembly.events[index].activity_point(),
+        }
+    }
+
+    pub fn view(&self, index: usize) -> UsageEventView<'_> {
+        match self {
+            Self::Owned(events) => events[index].view(),
+            Self::Compact(assembly) => assembly.view(index),
+        }
+    }
+
+    pub fn details(&self, indices: impl Iterator<Item = usize>) -> Vec<UsageEvent> {
+        match self {
+            Self::Owned(events) => indices.map(|index| events[index].clone()).collect(),
+            Self::Compact(assembly) => assembly.details(indices),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CompactUsageAssembly {
+    events: Vec<UsageEventData<StringId, StringId>>,
+    text: String,
+    ends: Vec<usize>,
+}
+
+impl CompactUsageAssembly {
+    pub fn new(events: Vec<UsageEvent>, previous: Option<Self>) -> Self {
+        // Reuse retained buffers across refreshes to avoid repeated large allocation
+        // and free operations, which can inflate the allocator's cached memory.
+        let mut assembly = previous.unwrap_or_default();
+        assembly.events.clear();
+        assembly.events.reserve(events.len());
+        assembly.text.clear();
+        assembly.ends.clear();
+        let mut dictionary = HashMap::<String, StringId>::new();
+        assembly.events.extend(events.into_iter().map(|event| {
+            let path = dictionary
+                .get(event.source_path.as_ref())
+                .copied()
+                .unwrap_or_else(|| intern(&mut dictionary, event.source_path.to_string()));
+            event.map_text(path, |text| intern(&mut dictionary, text))
+        }));
+
+        // Pack the dictionary into one allocation; keep neither a lookup hash table
+        // nor one allocation per unique string alive between requests.
+        let mut ordered = vec![String::new(); dictionary.len()];
+        let mut bytes = 0;
+        for (text, id) in dictionary {
+            bytes += text.len();
+            ordered[id.0.get() - 1] = text;
+        }
+        assembly.text.reserve(bytes);
+        assembly.ends.reserve(ordered.len());
+        for value in ordered {
+            assembly.text.push_str(&value);
+            assembly.ends.push(assembly.text.len());
+        }
+        assembly
+    }
+
+    pub fn text(&self, id: StringId) -> &str {
+        let index = id.0.get() - 1;
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.text[start..self.ends[index]]
+    }
+
+    pub fn view(&self, index: usize) -> UsageEventView<'_> {
+        let event = &self.events[index];
+        event
+            .clone()
+            .map_text(self.text(event.source_path), |id| self.text(id))
+    }
+
+    pub fn details(&self, indices: impl Iterator<Item = usize>) -> Vec<UsageEvent> {
+        // Preserve the parser's per-file path sharing in detailed responses too.
+        let mut paths = HashMap::<StringId, Arc<str>>::new();
+        indices
+            .map(|index| {
+                let event = self.view(index);
+                let path = paths
+                    .entry(self.events[index].source_path)
+                    .or_insert_with(|| Arc::from(event.source_path))
+                    .clone();
+                event.map_text(path, str::to_owned)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn event(&self, index: usize) -> UsageEvent {
+        self.details(std::iter::once(index)).pop().unwrap()
+    }
+}
+
+fn intern(dictionary: &mut HashMap<String, StringId>, text: String) -> StringId {
+    let next = StringId(NonZeroUsize::new(dictionary.len() + 1).unwrap());
+    *dictionary.entry(text).or_insert(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usage::TokenBuckets;
+
+    #[test]
+    fn compaction_preserves_details_and_accounting_flags() {
+        let event = UsageEvent {
+            source: "codex",
+            source_path: Arc::from("/logs/会話.jsonl"),
+            source_record_id: Some("record-1".into()),
+            session_id: Some("session-1".into()),
+            request_id: Some("request-1".into()),
+            message_id: Some("message-1".into()),
+            timestamp_ms: u64::MAX,
+            project: Some("/projects/é".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5.4".into()),
+            tokens: TokenBuckets {
+                raw_input: 1,
+                uncached_input: 2,
+                cache_read: 3,
+                cache_write: 4,
+                cache_write_1h: 5,
+                output: 6,
+                reasoning: 7,
+            },
+            source_cost_usd: Some(0.123456),
+            cost_authoritative: true,
+            dedupe_confidence: "strong",
+            conservative_undercount: true,
+            cache_chain_excluded: true,
+            sidechain: true,
+            permission_review: true,
+            source_order: u64::MAX,
+        };
+        let mut empty = event.clone();
+        empty.source_path = Arc::from("");
+        empty.session_id = Some(String::new());
+        empty.source_record_id = None;
+        empty.request_id = None;
+        empty.message_id = None;
+        empty.project = None;
+        empty.provider = None;
+        empty.model = None;
+        empty.source_cost_usd = None;
+        empty.cost_authoritative = false;
+        empty.conservative_undercount = false;
+        empty.cache_chain_excluded = false;
+        empty.sidechain = false;
+        empty.permission_review = false;
+        empty.source_order = 0;
+        let original = vec![event, empty];
+        let assembly = CompactUsageAssembly::new(original.clone(), None);
+        let owned = UsageAssembly::Owned(original.clone());
+        for (index, expected) in original.iter().enumerate() {
+            let actual = assembly.event(index);
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(actual.cost_authoritative, expected.cost_authoritative);
+            assert_eq!(actual.cache_chain_excluded, expected.cache_chain_excluded);
+            assert_eq!(actual.sidechain, expected.sidechain);
+            assert_eq!(actual.permission_review, expected.permission_review);
+            assert_eq!(actual.source_order, expected.source_order);
+            assert_eq!(
+                serde_json::to_value(assembly.view(index)).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(owned.view(index)).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_text_is_stored_once_across_fields_and_events() {
+        let event = super::super::tests::cache_event("same", 1, "same", 10, 0, 0);
+        let assembly = CompactUsageAssembly::new(vec![event; 100], None);
+        assert_eq!(assembly.ends.len(), 3); // path, "same", provider
+        assert_eq!(
+            assembly.text.len(),
+            "log.jsonl".len() + "same".len() + "anthropic".len()
+        );
+        assert!(std::mem::size_of_val(&assembly.events[0]) < std::mem::size_of::<UsageEvent>());
+        assert_eq!(assembly.event(99).session_id.as_deref(), Some("same"));
+        let details = assembly.details(0..100);
+        assert!(Arc::ptr_eq(
+            &details[0].source_path,
+            &details[99].source_path
+        ));
+    }
+
+    #[test]
+    fn refresh_reuses_storage_and_replaces_events_without_stale_text() {
+        let event = super::super::tests::cache_event("old", 1, "same", 10, 0, 0);
+        let mut assembly = CompactUsageAssembly::new(vec![event; 100], None);
+        let event_buffer = assembly.events.as_ptr();
+        let text_buffer = assembly.text.as_ptr();
+        let offset_buffer = assembly.ends.as_ptr();
+        for timestamp in 2..22 {
+            let mut updated = super::super::tests::cache_event("new", timestamp, "diff", 20, 0, 0);
+            updated.permission_review = true;
+            assembly = CompactUsageAssembly::new(vec![updated.clone(); 100], Some(assembly));
+            assert_eq!(assembly.events.as_ptr(), event_buffer);
+            assert_eq!(assembly.text.as_ptr(), text_buffer);
+            assert_eq!(assembly.ends.as_ptr(), offset_buffer);
+            assert_eq!(assembly.events.len(), 100);
+            assert_eq!(
+                serde_json::to_value(assembly.event(99)).unwrap(),
+                serde_json::to_value(&updated).unwrap()
+            );
+            assert!(assembly.view(99).permission_review);
+        }
+
+        let grown = super::super::tests::cache_event("bigger", 22, "same", 30, 0, 0);
+        assembly = CompactUsageAssembly::new(vec![grown.clone(); 101], Some(assembly));
+        assert_eq!(assembly.events.len(), 101);
+        assert_eq!(
+            serde_json::to_value(assembly.event(100)).unwrap(),
+            serde_json::to_value(grown).unwrap()
+        );
+
+        assembly = CompactUsageAssembly::new(Vec::new(), Some(assembly));
+        assert!(assembly.events.is_empty());
+        assert!(assembly.text.is_empty());
+        assert!(assembly.ends.is_empty());
+        assert!(assembly.details(0..0).is_empty());
+    }
+}
+
+impl<S, P> UsageEventData<S, P> {
+    fn activity_point(&self) -> UsageActivityPoint {
+        UsageActivityPoint {
+            source: self.source,
+            timestamp_ms: self.timestamp_ms,
+            total_tokens: self.tokens.total(),
+        }
+    }
+    fn map_text<T, Q>(self, source_path: Q, mut map: impl FnMut(S) -> T) -> UsageEventData<T, Q> {
+        UsageEventData {
+            source: self.source,
+            source_path,
+            source_record_id: self.source_record_id.map(&mut map),
+            session_id: self.session_id.map(&mut map),
+            request_id: self.request_id.map(&mut map),
+            message_id: self.message_id.map(&mut map),
+            timestamp_ms: self.timestamp_ms,
+            project: self.project.map(&mut map),
+            provider: self.provider.map(&mut map),
+            model: self.model.map(&mut map),
+            tokens: self.tokens,
+            source_cost_usd: self.source_cost_usd,
+            cost_authoritative: self.cost_authoritative,
+            dedupe_confidence: self.dedupe_confidence,
+            conservative_undercount: self.conservative_undercount,
+            cache_chain_excluded: self.cache_chain_excluded,
+            sidechain: self.sidechain,
+            permission_review: self.permission_review,
+            source_order: self.source_order,
+        }
+    }
+}
+
+impl UsageEvent {
+    fn view(&self) -> UsageEventView<'_> {
+        UsageEventData {
+            source: self.source,
+            source_path: &self.source_path,
+            source_record_id: self.source_record_id.as_deref(),
+            session_id: self.session_id.as_deref(),
+            request_id: self.request_id.as_deref(),
+            message_id: self.message_id.as_deref(),
+            timestamp_ms: self.timestamp_ms,
+            project: self.project.as_deref(),
+            provider: self.provider.as_deref(),
+            model: self.model.as_deref(),
+            tokens: self.tokens.clone(),
+            source_cost_usd: self.source_cost_usd,
+            cost_authoritative: self.cost_authoritative,
+            dedupe_confidence: self.dedupe_confidence,
+            conservative_undercount: self.conservative_undercount,
+            cache_chain_excluded: self.cache_chain_excluded,
+            sidechain: self.sidechain,
+            permission_review: self.permission_review,
+            source_order: self.source_order,
+        }
+    }
+}

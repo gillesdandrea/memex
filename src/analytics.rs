@@ -2116,12 +2116,10 @@ fn infer_session_kind(
                 }
             }
         }
-        SourceKind::Opencode => {
+        SourceKind::Opencode if opencode.has_parent(source_path, session_id) => {
             // Same value the parser stores, so parse-time and backfill
             // classification can never disagree.
-            if opencode.has_parent(source_path, session_id) {
-                return Some("fork".to_string());
-            }
+            return Some("fork".to_string());
         }
         // Match whole path components (like the Cursor parser's
         // `is_subagent_transcript`): a bare substring would false-positive

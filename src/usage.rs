@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod compact;
+use compact::{UsageAssembly, UsageEventView};
+
 #[derive(Clone, Debug, Default)]
 pub struct UsageQuery {
     pub source: Option<SourceFilter>,
@@ -98,20 +101,24 @@ impl TokenBuckets {
     }
 }
 
+pub type UsageEvent = UsageEventData<String, Arc<str>>;
+
+/// The same event fields are used by parsers, borrowed report views, and compact storage.
+/// Only the text representation changes; the public event and wire formats stay owned.
 #[derive(Clone, Debug, Serialize)]
-pub struct UsageEvent {
+pub struct UsageEventData<S, P> {
     pub source: &'static str,
     /// Shared across every event of a file: assembled scans materialize millions of
     /// events, and per-event owned paths dominated allocation time.
-    pub source_path: Arc<str>,
-    pub source_record_id: Option<String>,
-    pub session_id: Option<String>,
-    pub request_id: Option<String>,
-    pub message_id: Option<String>,
+    pub source_path: P,
+    pub source_record_id: Option<S>,
+    pub session_id: Option<S>,
+    pub request_id: Option<S>,
+    pub message_id: Option<S>,
     pub timestamp_ms: u64,
-    pub project: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
+    pub project: Option<S>,
+    pub provider: Option<S>,
+    pub model: Option<S>,
     pub tokens: TokenBuckets,
     pub source_cost_usd: Option<f64>,
     /// A missing source cost is intentionally covered by an authoritative aggregate.
@@ -211,27 +218,35 @@ pub fn scan_usage_activity(query: &UsageQuery) -> Result<(Vec<UsageActivityPoint
 pub(crate) fn scan_usage_activity_with_warnings(
     query: &UsageQuery,
 ) -> Result<(Vec<UsageActivityPoint>, Vec<String>)> {
+    let mut points = Vec::new();
+    let warnings = visit_usage_activity(query, |point| points.push(point))?;
+    Ok((points, warnings))
+}
+
+/// Visit matching chart points without allocating a per-event result vector.
+/// The callback runs under the usage scan lock and must not start another usage scan.
+pub fn visit_usage_activity(
+    query: &UsageQuery,
+    mut visit: impl FnMut(UsageActivityPoint),
+) -> Result<Vec<String>> {
     let _scan_guard = USAGE_SCAN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (assembled, warnings) = memoized_usage_events(query);
-    let points = filtered_events(&assembled, query)
-        .map(|event| UsageActivityPoint {
-            source: event.source,
-            timestamp_ms: event.timestamp_ms,
-            total_tokens: event.tokens.total(),
-        })
-        .collect();
-    Ok((points, warnings.as_ref().clone()))
+    for index in filtered_events(&assembled, query) {
+        visit(assembled.activity_point(index));
+    }
+    Ok(warnings.as_ref().clone())
 }
 
 /// Assembled events are already sorted; filtering preserves that order.
 fn filtered_events<'a>(
-    assembled: &'a [UsageEvent],
+    assembled: &'a UsageAssembly,
     query: &'a UsageQuery,
-) -> impl Iterator<Item = &'a UsageEvent> + 'a {
+) -> impl Iterator<Item = usize> + 'a {
     let mut project_cache = HashMap::new();
-    assembled.iter().filter(move |event| {
+    (0..assembled.len()).filter(move |&index| {
+        let event = assembled.filter_fields(index);
         (query.include_reviews || !event.permission_review)
             && query
                 .since_ms
@@ -240,7 +255,7 @@ fn filtered_events<'a>(
                 .until_ms
                 .is_none_or(|until| event.timestamp_ms < until)
             && query.project.as_deref().is_none_or(|project| {
-                event.project.as_deref().is_some_and(|candidate| {
+                event.project.is_some_and(|candidate| {
                     usage_project_matches(
                         candidate,
                         project,
@@ -250,8 +265,8 @@ fn filtered_events<'a>(
                 })
             })
             && query.session_keys.as_ref().is_none_or(|session_keys| {
-                event.session_id.as_ref().is_some_and(|session_id| {
-                    session_keys.contains(&(event.source.to_string(), session_id.clone()))
+                event.session_id.is_some_and(|session_id| {
+                    session_keys.contains(&(event.source.to_string(), session_id.to_owned()))
                 })
             })
     })
@@ -262,7 +277,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (assembled, warnings) = memoized_usage_events(query);
-    let events: Vec<&UsageEvent> = filtered_events(&assembled, query).collect();
+    let events: Vec<usize> = filtered_events(&assembled, query).collect();
 
     let mut by_source: HashMap<&'static str, UsageSummary> = HashMap::new();
     let mut report = UsageReport {
@@ -272,13 +287,13 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
         warnings: warnings.as_ref().clone(),
         ..UsageReport::default()
     };
-    for event in events.iter().copied() {
+    for event in events.iter().map(|&index| assembled.view(index)) {
         let total = event.tokens.additive_total();
         report.events += 1;
         report.total_tokens = report.total_tokens.saturating_add(total);
         report.unknown_model_events += u64::from(event.model.is_none());
         report.conservative_events += u64::from(event.conservative_undercount);
-        let cost = event_cost_nanos(event, query.cost_mode);
+        let cost = event_cost_nanos(&event, query.cost_mode);
         if let Some(cost) = cost {
             report.priced_events += 1;
             report.known_cost_usd += cost as f64 / 1_000_000_000.0;
@@ -307,7 +322,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
             row.unpriced_events += 1;
         }
     }
-    for (source, waste) in compute_cache_waste(events.iter().copied()) {
+    for (source, waste) in compute_cache_waste(events.iter().map(|&index| assembled.view(index))) {
         report.cache_waste.absorb(&waste);
         if let Some(row) = by_source.get_mut(&source) {
             row.cache_waste = waste;
@@ -316,7 +331,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     report.by_source = by_source.into_values().collect();
     report.by_source.sort_by(|a, b| a.source.cmp(&b.source));
     if query.include_events {
-        report.details = events.into_iter().cloned().collect();
+        report.details = assembled.details(events.into_iter());
     }
     Ok(report)
 }
@@ -352,7 +367,7 @@ struct CacheChainState<'a> {
 /// Chains start at the first event a caller passes in, so window filters only undercount at
 /// their leading edge.
 fn compute_cache_waste<'a>(
-    events: impl IntoIterator<Item = &'a UsageEvent>,
+    events: impl IntoIterator<Item = UsageEventView<'a>>,
 ) -> HashMap<&'static str, CacheWaste> {
     let mut chains: HashMap<(&'a str, &'a str, &'a str), CacheChainState<'a>> = HashMap::new();
     let mut by_source: HashMap<&'static str, CacheWaste> = HashMap::new();
@@ -360,7 +375,7 @@ fn compute_cache_waste<'a>(
         if event.sidechain {
             continue;
         }
-        let Some(session_id) = event.session_id.as_deref() else {
+        let Some(session_id) = event.session_id else {
             continue;
         };
         // A chain is one process's linear request stream, which is the transcript file, not
@@ -370,7 +385,7 @@ fn compute_cache_waste<'a>(
         let thread = if event.source == "opencode" {
             ""
         } else {
-            event.source_path.as_ref()
+            event.source_path
         };
         let key = (event.source, session_id, thread);
         if event.cache_chain_excluded {
@@ -390,10 +405,7 @@ fn compute_cache_waste<'a>(
             continue;
         }
         let cached = tokens.cache_read.saturating_add(tokens.cache_write);
-        let model = (
-            event.provider.as_deref().unwrap_or(""),
-            event.model.as_deref().unwrap_or(""),
-        );
+        let model = (event.provider.unwrap_or(""), event.model.unwrap_or(""));
         let mut reported_cache = cached > 0;
         if let Some(prev) = chains.get(&key) {
             reported_cache |= prev.reported_cache;
@@ -412,7 +424,7 @@ fn compute_cache_waste<'a>(
                     let waste = by_source.entry(event.source).or_default();
                     waste.miss_count += 1;
                     waste.missed_tokens = waste.missed_tokens.saturating_add(missed);
-                    waste.missed_cost_usd += cache_miss_cost_usd(event, missed);
+                    waste.missed_cost_usd += cache_miss_cost_usd(&event, missed);
                     if model != prev.model {
                         waste.model_switch_misses += 1;
                     } else if event.timestamp_ms.saturating_sub(prev.timestamp_ms) >= CACHE_TTL_MS {
@@ -437,11 +449,11 @@ fn compute_cache_waste<'a>(
 /// Extra USD paid for `missed_tokens` vs. reading them from cache. Missed tokens can only
 /// land in the uncached-input or cache-write buckets, so the paid rate is the blend of this
 /// event's own paid buckets at catalog rates; 0 when the model is unpriced.
-fn cache_miss_cost_usd(event: &UsageEvent, missed_tokens: u64) -> f64 {
-    let Some(model) = event.model.as_deref() else {
+fn cache_miss_cost_usd(event: &UsageEventView<'_>, missed_tokens: u64) -> f64 {
+    let Some(model) = event.model else {
         return 0.0;
     };
-    let Some(rates) = rates_for(event.provider.as_deref(), model) else {
+    let Some(rates) = rates_for(event.provider, model) else {
         return 0.0;
     };
     let cache_write_1h = event.tokens.cache_write_1h.min(event.tokens.cache_write);
@@ -466,7 +478,7 @@ fn cache_miss_cost_usd(event: &UsageEvent, missed_tokens: u64) -> f64 {
 struct UsageMemo {
     key: (Option<SourceFilter>, Option<PathBuf>),
     built: Instant,
-    events: Arc<Vec<UsageEvent>>,
+    events: Arc<UsageAssembly>,
     warnings: Arc<Vec<String>>,
 }
 
@@ -474,7 +486,7 @@ static USAGE_MEMO: Lazy<Mutex<Option<UsageMemo>>> = Lazy::new(|| Mutex::new(None
 
 /// Returns the assembled (pre-filter) events, reusing the previous in-process assembly
 /// when the query opts into a memo TTL. Callers must hold `USAGE_SCAN_LOCK`.
-fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<String>>) {
+fn memoized_usage_events(query: &UsageQuery) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let key = (query.source, query.cache_path.clone());
     let ttl = Duration::from_millis(query.memo_ttl_ms);
     if !ttl.is_zero()
@@ -487,6 +499,17 @@ fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<S
     {
         return (memo.events.clone(), memo.warnings.clone());
     }
+    // All callers hold USAGE_SCAN_LOCK through their query. Reuse the expired
+    // compact buffers instead of allocating a second retained history on refresh.
+    let previous = if !ttl.is_zero() {
+        USAGE_MEMO
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .and_then(|memo| Arc::try_unwrap(memo.events).ok())
+    } else {
+        None
+    };
     let assembly_start = Instant::now();
     let (events, warnings) = assemble_usage_events(query.source, query.cache_path.as_deref());
     usage_timing(assembly_start, || {
@@ -494,8 +517,13 @@ fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<S
     });
     // Stamp the memo after assembly: an assembly slower than the TTL would otherwise be
     // expired the moment it finishes, and queued follow-up queries would reassemble.
+    let events = Arc::new(if ttl.is_zero() {
+        // One-shot queries do not retain their assembly, so skip dictionary building.
+        UsageAssembly::Owned(events)
+    } else {
+        UsageAssembly::new(events, previous)
+    });
     let built = Instant::now();
-    let events = Arc::new(events);
     let warnings = Arc::new(warnings);
     if !ttl.is_zero() {
         *USAGE_MEMO
@@ -561,15 +589,37 @@ fn assemble_usage_events(
         format!("reconcile ({} events kept)", events.len())
     });
     let sort_start = Instant::now();
-    events.par_sort_by(|a, b| {
-        (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
-            b.timestamp_ms,
-            &b.source_path,
-            b.source_order,
-        ))
-    });
+    sort_usage_events(&mut events);
     usage_timing(sort_start, || "sort".to_string());
     (events, warnings)
+}
+
+/// Preserve stable event ordering without the full event-sized scratch allocation
+/// used by a parallel merge sort. Sorting indices also avoids repeatedly moving the
+/// large owned records. Original positions break equal-key ties exactly as before.
+fn sort_usage_events(events: &mut [UsageEvent]) {
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.par_sort_unstable_by(|&left, &right| {
+        let a = &events[left];
+        let b = &events[right];
+        (a.timestamp_ms, &a.source_path, a.source_order)
+            .cmp(&(b.timestamp_ms, &b.source_path, b.source_order))
+            .then_with(|| left.cmp(&right))
+    });
+    // Each entry maps a destination to its original position. Follow each cycle,
+    // placing its next record and marking visited positions as fixed points.
+    for start in 0..order.len() {
+        let mut current = start;
+        loop {
+            let next = order[current];
+            order[current] = current;
+            if next == start {
+                break;
+            }
+            events.swap(current, next);
+            current = next;
+        }
+    }
 }
 
 /// When `MEMEX_USAGE_TIMING` is set (and not "0"), prints per-phase scan timings to
@@ -1199,6 +1249,8 @@ fn scan_files_cached_with(
             format!("{source} parse ({missing_count} changed files)")
         });
     }
+    // The decoded lengths are known; avoid repeatedly reallocating the large event buffer.
+    out.reserve(slots.iter().flatten().map(Vec::len).sum());
     for events in slots.into_iter().flatten() {
         out.extend(events);
     }
@@ -1570,7 +1622,10 @@ const fn usd_per_million(value_milli_usd: u64) -> u64 {
     value_milli_usd * 1_000_000
 }
 
-pub(crate) fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
+pub(crate) fn event_cost_nanos<S: std::ops::Deref<Target = str>, P>(
+    event: &UsageEventData<S, P>,
+    mode: CostMode,
+) -> Option<u64> {
     let source = event
         .source_cost_usd
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -1589,7 +1644,9 @@ pub(crate) fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64
     }
 }
 
-fn calculated_cost_nanos(event: &UsageEvent) -> Option<u64> {
+fn calculated_cost_nanos<S: std::ops::Deref<Target = str>, P>(
+    event: &UsageEventData<S, P>,
+) -> Option<u64> {
     let rates = rates_for(event.provider.as_deref(), event.model.as_deref()?)?;
     let cache_write_1h = event.tokens.cache_write_1h.min(event.tokens.cache_write);
     let cache_write_5m = event.tokens.cache_write.saturating_sub(cache_write_1h);
@@ -2330,7 +2387,7 @@ mod tests {
         assert_eq!(tokens.additive_total(), 110);
     }
 
-    fn cache_event(
+    pub(super) fn cache_event(
         session: &str,
         timestamp_ms: u64,
         model: &str,
@@ -2370,7 +2427,37 @@ mod tests {
     }
 
     fn waste_for(events: &[UsageEvent]) -> Option<CacheWaste> {
-        compute_cache_waste(events.iter()).remove("claude")
+        let assembly = UsageAssembly::new(events.to_vec(), None);
+        compute_cache_waste((0..assembly.len()).map(|index| assembly.view(index))).remove("claude")
+    }
+
+    #[test]
+    fn index_sort_preserves_stable_order_including_equal_keys() {
+        for len in [0, 1, 2, 7, 128, 4097] {
+            let mut events: Vec<_> = (0..len)
+                .map(|index| {
+                    let mut event =
+                        cache_event("session", ((index * 17) % 23) as u64, "model", 10, 0, 0);
+                    event.source_path = Arc::from(format!("path-{}", (index * 7) % 3));
+                    event.source_order = (index % 5) as u64;
+                    event.source_record_id = Some(index.to_string());
+                    event
+                })
+                .collect();
+            let mut expected = events.clone();
+            expected.sort_by(|a, b| {
+                (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
+                    b.timestamp_ms,
+                    &b.source_path,
+                    b.source_order,
+                ))
+            });
+            sort_usage_events(&mut events);
+            assert_eq!(
+                serde_json::to_value(events).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -2493,7 +2580,8 @@ mod tests {
         second.source = "hermes";
         second.source_path = Arc::from("hermes.db");
         second.cache_chain_excluded = true;
-        let waste = compute_cache_waste([&first, &second]);
+        let assembly = UsageAssembly::new(vec![first, second], None);
+        let waste = compute_cache_waste([assembly.view(0), assembly.view(1)]);
         assert!(!waste.contains_key("hermes"));
     }
 
@@ -2542,7 +2630,8 @@ mod tests {
         let mut second = cache_event("s", 10 * 60 * 1000, "claude-sonnet-4-6", 0, 0, 100_500);
         second.source = "opencode";
         second.source_path = Arc::from("msg-2.json");
-        let waste = compute_cache_waste([&first, &second])
+        let assembly = UsageAssembly::new(vec![first, second], None);
+        let waste = compute_cache_waste([assembly.view(0), assembly.view(1)])
             .remove("opencode")
             .expect("miss counted");
         assert_eq!(waste.miss_count, 1);
@@ -3338,6 +3427,8 @@ mod tests {
         assert_eq!(first.total_tokens, 10);
         assert_eq!(memoized.total_tokens, 10);
         assert_eq!(fresh.total_tokens, 80);
+        // An uncached query must not evict another caller's still-valid memo.
+        assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
     }
 
     #[test]
