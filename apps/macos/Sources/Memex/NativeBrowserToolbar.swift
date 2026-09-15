@@ -70,6 +70,7 @@ import SwiftUI
     let toolbar = NSToolbar(identifier: "MemexBrowserColumns-\(UUID().uuidString)")
     let store: Store
     let splitView: NSSplitView
+    private lazy var resumeController = ResumeToolbarController(store: store)
     private var actionItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     private var searchItem: NSSearchToolbarItem?
     private(set) var filterPopover: NSPopover?
@@ -103,6 +104,8 @@ import SwiftUI
             _ = store.query
             _ = store.filters
             _ = store.scope
+            _ = store.loadingSessionMetadata
+            _ = store.sessionMetadataError
         } onChange: { [weak self] in
             // Observation fires before the mutation; read the completed state
             // on the next main-loop turn, then subscribe to subsequent changes.
@@ -144,9 +147,8 @@ import SwiftUI
             return action(id, title: "Filter conversations", symbol: "line.3.horizontal.decrease", selector: #selector(toggleFilters))
         case Self.resume:
             let item = NSToolbarItem(itemIdentifier: id)
-            item.view = NSHostingView(rootView: ResumeToolbarButton(store: store).frame(minWidth: 1, minHeight: 32))
+            item.view = resumeController.control
             item.label = "Resume"
-            item.isBordered = false
             return item
         case Self.search:
             let item = NSSearchToolbarItem(itemIdentifier: id)
@@ -201,6 +203,7 @@ import SwiftUI
         }
 
         actionItems[Self.refresh]?.isEnabled = !store.loadingSessions
+        resumeController.update()
         actionItems[Self.find]?.isEnabled = store.selected != nil
         actionItems[Self.copyID]?.isEnabled = store.selected != nil
         actionItems[Self.reveal]?.isEnabled = store.selected?.machineID == "local"

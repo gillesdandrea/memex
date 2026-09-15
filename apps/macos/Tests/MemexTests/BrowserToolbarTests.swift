@@ -5,6 +5,33 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct BrowserToolbarTests {
+    @Test func resumeUsesNativeToolbarSegmentsAndTracksSelection() throws {
+        let (window, _, controller) = fixture()
+        defer { window.close() }
+        let resume = try item(BrowserToolbarController.resume, in: controller)
+        let control = try #require(resume.view as? NSSegmentedControl)
+        #expect(control.isHidden)
+        #expect(!control.isEnabled)
+
+        let session = Session(source: "codex", sessionID: "native-resume", sourcePath: "/fixture", project: "memex",
+                              resumeCommand: "codex resume native-resume", cwd: "/tmp")
+        controller.store.sessions = [session]
+        controller.store.selectedID = session.id
+        controller.update()
+        pump(window)
+        #expect(resume.view === control)
+        #expect(control.window === window)
+        #expect(!control.isHidden)
+        #expect(control.isEnabled(forSegment: 0))
+        #expect(control.isEnabled(forSegment: 1))
+        #expect(control.menu(forSegment: 1)?.items.isEmpty == false)
+
+        controller.store.selectedID = nil
+        controller.update()
+        #expect(control.isHidden)
+        #expect(!control.isEnabled)
+    }
+
     @Test func nativeRootKeepsToolbarAndFullHeightSidebarAcrossHostedUpdates() async throws {
         _ = NSApplication.shared
         let store = Store()
