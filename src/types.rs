@@ -135,7 +135,7 @@ impl SourceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, Serialize, Deserialize)]
 #[value(rename_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceFilter {

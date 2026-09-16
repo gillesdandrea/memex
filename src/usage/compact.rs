@@ -19,7 +19,6 @@ pub(super) enum UsageAssembly {
 
 pub(super) struct FilterFields<'a> {
     pub source: &'static str,
-    pub timestamp_ms: u64,
     pub permission_review: bool,
     pub project: Option<&'a str>,
     pub session_id: Option<&'a str>,
@@ -41,13 +40,72 @@ impl UsageAssembly {
         }
     }
 
+    pub fn timestamp_ms(&self, index: usize) -> u64 {
+        match self {
+            Self::Owned(events) => events[index].timestamp_ms,
+            Self::Compact(assembly) => assembly.events[index].timestamp_ms,
+        }
+    }
+
+    /// Global sort key: timestamp, source path, then source order. Merging
+    /// partitions by this key reproduces the combined assembly's sort exactly.
+    pub fn sort_key(&self, index: usize) -> (u64, &str, u64) {
+        match self {
+            Self::Owned(events) => {
+                let event = &events[index];
+                (
+                    event.timestamp_ms,
+                    event.source_path.as_ref(),
+                    event.source_order,
+                )
+            }
+            Self::Compact(assembly) => {
+                let event = &assembly.events[index];
+                (
+                    event.timestamp_ms,
+                    assembly.text(event.source_path),
+                    event.source_order,
+                )
+            }
+        }
+    }
+
+    /// Lower bound of `since` in the timestamp-sorted assembly.
+    pub fn lower_bound(&self, since: u64) -> usize {
+        let mut lo = 0;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.timestamp_ms(mid) < since {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Upper bound of `until` (first index with `timestamp >= until`) starting from `start`.
+    pub fn upper_bound(&self, until: u64, start: usize) -> usize {
+        let mut lo = start;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.timestamp_ms(mid) < until {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     pub fn filter_fields(&self, index: usize) -> FilterFields<'_> {
         match self {
             Self::Owned(events) => {
                 let event = &events[index];
                 FilterFields {
                     source: event.source,
-                    timestamp_ms: event.timestamp_ms,
                     permission_review: event.permission_review,
                     project: event.project.as_deref(),
                     session_id: event.session_id.as_deref(),
@@ -57,7 +115,6 @@ impl UsageAssembly {
                 let event = &assembly.events[index];
                 FilterFields {
                     source: event.source,
-                    timestamp_ms: event.timestamp_ms,
                     permission_review: event.permission_review,
                     project: event.project.map(|id| assembly.text(id)),
                     session_id: event.session_id.map(|id| assembly.text(id)),

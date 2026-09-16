@@ -237,8 +237,17 @@ impl UsageDependency {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_current(&self) -> bool {
         Self::from_path_or_absent(&self.path_from_native()) == *self
+    }
+
+    /// Current on-disk fingerprint for this dependency's path, without comparing.
+    /// Scans cache one observation per distinct path so shared parent rollouts are
+    /// stat'd once per scan instead of once per dependent file.
+    pub(crate) fn observed(&self) -> (u64, i64, bool) {
+        let current = Self::from_path_or_absent(&self.path_from_native());
+        (current.size, current.mtime_ns, current.exists)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Run against a frozen CODEX_HOME and an isolated usage-cache path.
 //! The first invocation warms the disk cache; compare subsequent fresh processes.
-//! Arguments: CACHE_PATH [--verify] [--refreshes=N] [--no-memo] [--stream].
+//! Arguments: CACHE_PATH [--verify] [--refreshes=N] [--no-memo] [--stream] [--all].
 //! `--verify` hashes detailed reports and filter/cost variants without printing records.
 //! Live/peak bytes count requested Rust allocations; native allocations and allocator
 //! retention are excluded. macOS footprint/RSS measurements include the whole process.
@@ -146,6 +146,10 @@ fn main() -> anyhow::Result<()> {
         memo_ttl_ms: 60_000,
         ..UsageQuery::default()
     };
+    // `--all` exercises the merged multi-partition path instead of one source.
+    if std::env::args().any(|argument| argument == "--all") {
+        query.source = None;
+    }
     if std::env::args().any(|argument| argument == "--no-memo") {
         query.memo_ttl_ms = 0;
         let digest = measure("no_memo_chart", || chart_digest(&query))?;

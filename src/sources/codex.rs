@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Recompute ownership after excluding copied parent session metadata.
@@ -1258,13 +1258,21 @@ impl UsageTokens {
     }
 }
 
+/// One fork-resolution seed: the parent's shared snapshot index plus the fork cutoff.
+/// The counter borrows the shared index instead of copying the parent's snapshot
+/// history and rebuilding an inherited set per fork child.
+struct InheritedSeed {
+    parent: Arc<ParentData>,
+    cutoff_ms: u64,
+}
+
 #[derive(Default)]
 struct UsageCounter {
     counted: UsageTokens,
     raw_baseline: UsageTokens,
     watermark: UsageTokens,
     seen: Vec<UsageTokens>,
-    inherited_seen: HashSet<UsageTokens>,
+    inherited: Vec<InheritedSeed>,
     divergent: bool,
     interleaved: bool,
 }
@@ -1281,18 +1289,27 @@ impl UsageCounter {
         }
     }
 
-    fn seed_inherited(&mut self, snapshots: &[UsageTokens]) {
-        let Some(baseline) = snapshots.iter().copied().reduce(UsageTokens::max) else {
+    fn seed_inherited(&mut self, parent: &Arc<ParentData>, cutoff_ms: u64) {
+        let Some(baseline) = parent.inherited_baseline(cutoff_ms) else {
             return;
         };
-        self.inherited_seen.extend(snapshots.iter().copied());
+        self.inherited.push(InheritedSeed {
+            parent: Arc::clone(parent),
+            cutoff_ms,
+        });
         self.raw_baseline = baseline;
         self.watermark = self.watermark.max(baseline);
     }
 
+    fn is_inherited(&self, total: UsageTokens) -> bool {
+        self.inherited
+            .iter()
+            .any(|seed| seed.parent.is_inherited(total, seed.cutoff_ms))
+    }
+
     fn account(&mut self, last: Option<UsageTokens>, total: Option<UsageTokens>) -> UsageTokens {
         if let Some(total) = total {
-            if self.seen.contains(&total) || self.inherited_seen.contains(&total) {
+            if self.seen.contains(&total) || self.is_inherited(total) {
                 return UsageTokens::default();
             }
             if !total.at_least(self.watermark) {
@@ -1359,9 +1376,64 @@ fn contained_usage(
     }
 }
 
+/// Shared per-parent snapshot index. Snapshots are sorted once at load; fork children
+/// then answer both cutoff queries by binary search and hash lookup instead of each
+/// copying the parent's snapshot vector and rebuilding an inherited set.
 struct ParentData {
     deps: Vec<UsageDependency>,
-    snapshots: Vec<(u64, UsageTokens)>,
+    /// Ascending snapshot timestamps.
+    times: Vec<u64>,
+    /// Componentwise maxima over all snapshots up to each index.
+    prefix_max: Vec<UsageTokens>,
+    /// Earliest snapshot time for each distinct token total.
+    earliest: HashMap<UsageTokens, u64>,
+}
+
+impl ParentData {
+    fn new(deps: Vec<UsageDependency>, mut snapshots: Vec<(u64, UsageTokens)>) -> Self {
+        snapshots.sort_by_key(|(timestamp, _)| *timestamp);
+        let mut times = Vec::with_capacity(snapshots.len());
+        let mut prefix_max = Vec::with_capacity(snapshots.len());
+        let mut earliest: HashMap<UsageTokens, u64> = HashMap::with_capacity(snapshots.len());
+        let mut running = UsageTokens::default();
+        for (timestamp, tokens) in snapshots {
+            running = running.max(tokens);
+            times.push(timestamp);
+            prefix_max.push(running);
+            earliest
+                .entry(tokens)
+                .and_modify(|first| *first = (*first).min(timestamp))
+                .or_insert(timestamp);
+        }
+        Self {
+            deps,
+            times,
+            prefix_max,
+            earliest,
+        }
+    }
+
+    /// Number of snapshots at or before the fork cutoff.
+    fn inherited_count(&self, cutoff_ms: u64) -> usize {
+        self.times
+            .partition_point(|&timestamp| timestamp <= cutoff_ms)
+    }
+
+    /// Componentwise maximum over parent snapshots at or before the cutoff: the
+    /// inherited baseline. Order-independent like the previous reduce, but O(log n).
+    fn inherited_baseline(&self, cutoff_ms: u64) -> Option<UsageTokens> {
+        let count = self.inherited_count(cutoff_ms);
+        (count > 0).then(|| self.prefix_max[count - 1])
+    }
+
+    /// Whether the parent reported exactly this total at or before the cutoff.
+    /// Equivalent to membership in the pre-cutoff snapshot set, via the earliest
+    /// occurrence: a later duplicate cannot un-inherit an earlier snapshot.
+    fn is_inherited(&self, tokens: UsageTokens, cutoff_ms: u64) -> bool {
+        self.earliest
+            .get(&tokens)
+            .is_some_and(|&first| first <= cutoff_ms)
+    }
 }
 
 type ParentSlot = Option<Arc<ParentData>>;
@@ -1370,7 +1442,14 @@ type ParentSlot = Option<Arc<ParentData>>;
 /// dependency set is still complete, but does not interpret Codex hierarchy itself.
 pub(crate) struct UsageParentIndex {
     by_session: HashMap<String, Vec<PathBuf>>,
-    parents: Mutex<HashMap<String, ParentSlot>>,
+    /// Candidate path sets per session, fixed for the scan: `by_session` never changes
+    /// after construction, so dependency validation reuses these instead of rebuilding
+    /// candidate and recorded sets per cached file.
+    current_sets: HashMap<String, HashSet<String>>,
+    /// Per-parent initialization slots installed before I/O: concurrent fork parsers
+    /// missing the same parent block on one load instead of each scanning it.
+    /// Different parents still load concurrently.
+    parents: Mutex<HashMap<String, Arc<OnceLock<ParentSlot>>>>,
 }
 
 impl UsageParentIndex {
@@ -1381,17 +1460,38 @@ impl UsageParentIndex {
                 by_session.entry(session).or_default().push(path.clone());
             }
         }
+        let current_sets = by_session
+            .iter()
+            .map(|(session, paths)| {
+                (
+                    session.clone(),
+                    paths
+                        .iter()
+                        .filter_map(|path| path.to_str().map(str::to_owned))
+                        .collect(),
+                )
+            })
+            .collect();
         Self {
             by_session,
+            current_sets,
             parents: Mutex::new(HashMap::new()),
         }
     }
 
     fn load(&self, parent: &str) -> ParentSlot {
-        if let Some(slot) = self.parents.lock().unwrap().get(parent) {
-            return slot.clone();
-        }
-        let loaded = self.by_session.get(parent).and_then(|paths| {
+        let slot = self
+            .parents
+            .lock()
+            .unwrap()
+            .entry(parent.to_string())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone();
+        slot.get_or_init(|| self.load_uncached(parent)).clone()
+    }
+
+    fn load_uncached(&self, parent: &str) -> ParentSlot {
+        self.by_session.get(parent).and_then(|paths| {
             let mut deps = Vec::new();
             let mut snapshots = Vec::new();
             for path in paths {
@@ -1404,14 +1504,8 @@ impl UsageParentIndex {
                 deps.push(dependency);
                 snapshots.extend(file_snapshots);
             }
-            (!deps.is_empty()).then(|| Arc::new(ParentData { deps, snapshots }))
-        });
-        self.parents
-            .lock()
-            .unwrap()
-            .entry(parent.to_string())
-            .or_insert(loaded)
-            .clone()
+            (!deps.is_empty()).then(|| Arc::new(ParentData::new(deps, snapshots)))
+        })
     }
 
     pub fn deps_match_current_candidates(&self, deps: &[UsageDependency]) -> bool {
@@ -1421,28 +1515,21 @@ impl UsageParentIndex {
         let Some(session) = session_id_from_path(Path::new(&first.path)) else {
             return true;
         };
-        let current: HashSet<&str> = self
-            .by_session
-            .get(&session)
-            .map(|paths| paths.iter().filter_map(|path| path.to_str()).collect())
-            .unwrap_or_default();
-        let recorded: HashSet<&str> = deps.iter().map(|dep| dep.path.as_str()).collect();
-        current == recorded
+        let Some(current) = self.current_sets.get(&session) else {
+            return false;
+        };
+        // Set equality without building the recorded set: every recorded candidate must
+        // be current (no stale entry) and the counts must match (no new parent copy).
+        current.len() == deps.len() && deps.iter().all(|dep| current.contains(dep.path.as_str()))
     }
 
     fn resolve(
         &self,
         parent: &str,
         cutoff_ms: u64,
-    ) -> Option<(Vec<UsageDependency>, Vec<UsageTokens>)> {
+    ) -> Option<(Vec<UsageDependency>, Arc<ParentData>)> {
         let data = self.load(parent)?;
-        let totals = data
-            .snapshots
-            .iter()
-            .filter(|(timestamp, _)| *timestamp <= cutoff_ms)
-            .map(|(_, totals)| *totals)
-            .collect::<Vec<_>>();
-        (!totals.is_empty()).then(|| (data.deps.clone(), totals))
+        (data.inherited_count(cutoff_ms) > 0).then(|| (data.deps.clone(), Arc::clone(&data)))
     }
 }
 
@@ -1619,7 +1706,7 @@ pub(crate) fn parse_usage_file(
                 if let (Some(parent_id), Some(fork_ms)) = (&parent, fork_timestamp_ms)
                     && let Some((deps, inherited)) = parents.resolve(parent_id, fork_ms)
                 {
-                    counter.seed_inherited(&inherited);
+                    counter.seed_inherited(&inherited, fork_ms);
                     unresolved_fork_baseline_seen = true;
                     fork_resolved = true;
                     parent_deps = deps;
@@ -2855,5 +2942,132 @@ not json
                 .iter()
                 .any(|record| { record.text.contains("ciphertext-must-never-be-indexed") })
         );
+    }
+
+    #[test]
+    fn parent_index_matches_naive_cutoff_semantics() {
+        // Unsorted input with a duplicate total at two timestamps and diverging
+        // components, so the componentwise maximum differs from any one snapshot.
+        let snapshots = vec![
+            (30, usage(10, 0, 5)),
+            (10, usage(4, 1, 2)),
+            (20, usage(10, 0, 5)),
+            (25, usage(3, 9, 1)),
+            (40, usage(12, 9, 6)),
+        ];
+        let parent = ParentData::new(Vec::new(), snapshots.clone());
+        for cutoff in [0, 9, 10, 15, 20, 24, 25, 29, 30, 39, 40, 100] {
+            let eligible: Vec<UsageTokens> = snapshots
+                .iter()
+                .filter(|(timestamp, _)| *timestamp <= cutoff)
+                .map(|(_, tokens)| *tokens)
+                .collect();
+            let naive_baseline = eligible.iter().copied().reduce(UsageTokens::max);
+            assert_eq!(
+                parent.inherited_baseline(cutoff),
+                naive_baseline,
+                "baseline at {cutoff}"
+            );
+            assert_eq!(parent.inherited_count(cutoff), eligible.len());
+            for probe in [
+                usage(4, 1, 2),
+                usage(10, 0, 5),
+                usage(3, 9, 1),
+                usage(12, 9, 6),
+                usage(0, 0, 0),
+                usage(99, 99, 99),
+            ] {
+                assert_eq!(
+                    parent.is_inherited(probe, cutoff),
+                    eligible.contains(&probe),
+                    "membership {probe:?} at {cutoff}"
+                );
+            }
+        }
+        let empty = ParentData::new(Vec::new(), Vec::new());
+        assert_eq!(empty.inherited_baseline(100), None);
+        assert_eq!(empty.inherited_count(100), 0);
+        assert!(!empty.is_inherited(usage(1, 1, 1), 100));
+    }
+
+    #[test]
+    fn counter_dedupes_parent_totals_through_shared_index() {
+        let parent = Arc::new(ParentData::new(
+            Vec::new(),
+            vec![(10, usage(5, 0, 0)), (20, usage(8, 0, 0))],
+        ));
+        let mut counter = UsageCounter::default();
+        counter.seed_inherited(&parent, 25);
+        // Replaying an inherited total contributes nothing and advances no state:
+        // without the inherited check this below-baseline total would count 5 and
+        // flip the counter into interleaved mode.
+        assert!(counter.account(None, Some(usage(5, 0, 0))).zero());
+        assert!(!counter.interleaved);
+        // A new total above the inherited baseline counts only its delta.
+        assert_eq!(counter.account(None, Some(usage(10, 0, 0))), usage(2, 0, 0));
+        // A later seed with an earlier cutoff overwrites the baseline, but the union
+        // of inherited histories stays available for deduplication.
+        let mut reseeded = UsageCounter::default();
+        reseeded.seed_inherited(&parent, 25);
+        reseeded.seed_inherited(&parent, 15);
+        assert_eq!(reseeded.raw_baseline, usage(5, 0, 0));
+        assert_eq!(reseeded.watermark, usage(8, 0, 0));
+        assert!(reseeded.is_inherited(usage(5, 0, 0)));
+        assert!(reseeded.is_inherited(usage(8, 0, 0)));
+        // A cutoff before every snapshot seeds nothing.
+        let mut empty = UsageCounter::default();
+        empty.seed_inherited(&parent, 9);
+        assert!(empty.inherited.is_empty());
+        assert!(!empty.is_inherited(usage(5, 0, 0)));
+    }
+
+    #[test]
+    fn concurrent_parent_loads_share_one_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = "019f0000-0000-7000-8000-000000000001";
+        // Sibling copies are grouped by session id, not by filename.
+        for (timestamp, input) in [(10, 5), (12, 8)] {
+            fs::write(
+                temp.path().join(format!("rollout-{session}-{timestamp}.jsonl")),
+                format!(
+                    "{{\"type\":\"event_msg\",\"timestamp\":{timestamp},\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":{input}}}}}}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        // Rename into session-grouped files: the uuid in the stem is the session.
+        let files: Vec<PathBuf> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 2);
+        let parents = Arc::new(UsageParentIndex::new(&files));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let index = Arc::clone(&parents);
+            handles.push(std::thread::spawn(move || index.load(session)));
+        }
+        let results: Vec<ParentSlot> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(results.iter().all(|slot| slot.is_some()));
+        let first = results[0].as_ref().unwrap();
+        assert_eq!(first.inherited_baseline(u64::MAX), Some(usage(8, 0, 0)));
+        assert!(
+            results[1..]
+                .iter()
+                .all(|slot| Arc::ptr_eq(first, slot.as_ref().unwrap())),
+            "concurrent loads must share one parent load"
+        );
+        // Unknown parents resolve to a shared empty slot. File timestamps are epoch
+        // seconds, so the stored snapshots sit at 10_000 and 12_000 ms.
+        assert!(
+            parents
+                .load("019f0000-0000-7000-8000-000000000099")
+                .is_none()
+        );
+        assert!(parents.resolve(session, 9_999).is_none());
+        assert!(parents.resolve(session, 10_000).is_some());
     }
 }
