@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Memex
+Comment=Browse and search local agent conversation history
+Exec=memex-qt
+Icon=memex-qt
+Categories=Utility;
+Terminal=false

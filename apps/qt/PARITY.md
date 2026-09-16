@@ -34,7 +34,8 @@ fixture. They do not establish performance or provider coverage on a large real
 index. The transport tests exercise the app protocol and failure contracts with
 isolated socket fixtures; they do not change or restart the user's daemon.
 
-The executable embeds its QML/JavaScript resources. Qt shared libraries and QML
-runtime modules remain external dependencies. Signed/notarized macOS bundles,
-Linux distribution packages, an installer and release automation are separate
+The executable embeds its QML/JavaScript resources. Outside the Linux AppImage,
+Qt shared libraries and QML runtime modules remain external dependencies; the
+release AppImage vendors them plus the Memex CLI. Signed/notarized macOS
+bundles, native Linux distribution packages, and an installer are separate
 from this source-level app port.

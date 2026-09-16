@@ -35,6 +35,43 @@ they are not standalone installers or signed macOS application bundles.
 After extracting an archive, run `./memex-qt` from its directory. Linux CI archives
 are built against Fedora 44's Qt 6.11 runtime and are not portable Ubuntu binaries.
 
+## Install on Linux (AppImage)
+
+Tagged releases publish a self-contained
+`memex-qt-VERSION-linux-ARCH.AppImage` alongside the CLI archives. It bundles
+the Qt runtime and the Memex CLI, so neither needs to be installed separately:
+
+```sh
+chmod +x memex-qt-VERSION-linux-x86_64.AppImage
+./memex-qt-VERSION-linux-x86_64.AppImage
+```
+
+Running an AppImage directly needs `libfuse2` on the host. Without it, either
+extract and run (`./memex-qt-*.AppImage --appimage-extract-and-run`) or
+extract once and launch `squashfs-root/AppRun`.
+
+To build the AppImage locally (also requires `curl`, `jq`, `file`, Qt 6.10+
+with `qmake` on PATH, and OpenSSL development packages for the bundled CLI:
+`openssl-devel` on Fedora, `libssl-dev` plus `pkg-config` on Ubuntu;
+`linuxdeploy` tooling is downloaded automatically):
+
+```sh
+apps/qt/scripts/build-appimage.sh
+# Or stamp a version into the file name:
+apps/qt/scripts/build-appimage.sh 0.21.0
+```
+
+Verify a built AppImage with:
+
+```sh
+apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-*-linux-*.AppImage
+```
+
+The smoke test extracts the AppImage without FUSE, checks that the Qt runtime
+and CLI are bundled, and boots the app headless. Release AppImages are built
+on Ubuntu 22.04 for a low glibc baseline; do not expect Fedora-built archives
+to run on older distributions.
+
 The script uses Boxington (`mbx`) when installed. An explicit CLI or data root
 can be selected without changing user configuration:
 
@@ -108,4 +145,6 @@ remote HTTP links open only after an explicit user action.
 Qt Bridge is pinned to an upstream revision in `Cargo.toml`; `Cargo.lock` pins its
 transitive dependencies. Qt/Qt Bridge/CXX-Qt retain their upstream licenses. This
 package dynamically links Qt; distributing a standalone desktop bundle requires
-including the appropriate Qt runtime modules and license notices.
+including the appropriate Qt runtime modules and license notices. The release
+AppImage is such a bundle: usage/parity documentation and the project license
+travel inside it under `usr/share/doc/memex-qt`.

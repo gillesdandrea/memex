@@ -19,7 +19,7 @@ jobs:
   native-qt:
     runs-on: ubuntu-latest
     container: fedora:44
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -55,11 +55,20 @@ jobs:
       - name: Package native Qt development build
         run: bash apps/qt/scripts/build.sh dev
 
+      - name: Build Qt AppImage (smoke)
+        run: bash apps/qt/scripts/build-appimage.sh dev
+
+      - name: Smoke-test Qt AppImage
+        run: bash apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-dev-linux-*.AppImage
+
       - name: Upload Qt development archive
         uses: actions/upload-artifact@v7
         with:
           name: memex-qt-linux-x86_64-dev
-          path: apps/qt/build/*.tar.gz
+          path: |
+            apps/qt/build/*.tar.gz
+            apps/qt/build/*.AppImage
+            apps/qt/build/*.sha256
           if-no-files-found: error
 
       - name: Upload Qt test screenshots
