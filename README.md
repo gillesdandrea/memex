@@ -41,6 +41,15 @@ Or (with [Nix](https://nixos.org/)):
 nix run github:nicosuave/memex
 ```
 
+### Cargo (prebuilt binary via binstall)
+
+```bash
+cargo install cargo-binstall
+cargo binstall --locked --git https://github.com/nicosuave/memex
+```
+
+Prebuilt for macOS arm64 and Linux x86_64/arm64; other targets fall back to compiling from source.
+
 ### Cargo (Build from source)
 
 ```bash
