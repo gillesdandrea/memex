@@ -36,6 +36,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Jcode => config.jcode_resume_cmd.clone(),
         SourceKind::Muse => config.muse_resume_cmd.clone(),
         SourceKind::Antigravity => config.antigravity_resume_cmd.clone(),
+        SourceKind::Bob => config.bob_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -76,6 +77,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "antigravity" if find_in_path("antigravity").is_some() => {
             Some("cd {cwd_shell} && antigravity --conversation {session_id}".to_string())
+        }
+        "bob" if remote || find_in_path("bob").is_some() => {
+            Some("cd {cwd_shell} && bob --resume {session_id}".to_string())
         }
         _ => None,
     }
