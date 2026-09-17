@@ -1884,6 +1884,10 @@ fn is_standalone_system_instruction(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SourceFilter;
+    use crate::usage::{UsageQuery, scan_usage};
+    use rusqlite::Connection;
+    use std::collections::HashSet;
     use std::fs;
 
     fn usage(input: u64, cached: u64, output: u64) -> UsageTokens {
@@ -3069,5 +3073,493 @@ not json
         );
         assert!(parents.resolve(session, 9_999).is_none());
         assert!(parents.resolve(session, 10_000).is_some());
+    }
+    #[test]
+    fn codex_scanner_caches_events_by_file_metadata() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions/2026/07/03");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        std::fs::write(
+            sessions.join("rollout-2026-07-03-session.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-03T01:02:03Z","payload":{"id":"codex-session","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-03T01:02:05Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let cold = scan_usage(&query).expect("cold scan");
+        let warm = scan_usage(&query).expect("warm scan");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cached files");
+
+        assert_eq!(cold.events, 1);
+        assert_eq!(cold.details[0].tokens.total(), 125);
+        assert_eq!(cold.details[0].model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(cold.details[0].session_id.as_deref(), Some("codex-session"));
+        assert_eq!(cold.details[0].project.as_deref(), Some("/repo/memex"));
+        assert_eq!(warm.events, cold.events);
+        assert_eq!(warm.total_tokens, cold.total_tokens);
+        assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn codex_fork_children_inherit_parent_baselines() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        std::fs::write(
+            parent_dir.join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200},"total_token_usage":{"input_tokens":300}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:03:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+        // The child replays a TRUNCATED parent history (the total=300 snapshot is missing)
+        // under its own session id, so cross-file tuple dedupe cannot suppress it; only the
+        // inherited parent baseline can.
+        std::fs::write(
+            child_dir.join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let report = scan_usage(&query).expect("scan usage");
+
+        // Parent turns: 100 + 200 + 300. Child: only the post-fork turn of 150.
+        assert_eq!(report.total_tokens, 750);
+        assert_eq!(report.events, 4);
+        let child_events: Vec<_> = report
+            .details
+            .iter()
+            .filter(|event| event.source_path.contains("2026-07-15T09-00-00"))
+            .collect();
+        assert_eq!(child_events.len(), 1);
+        assert_eq!(child_events[0].tokens.total(), 150);
+        assert!(!child_events[0].conservative_undercount);
+    }
+
+    #[test]
+    fn codex_unresolved_fork_is_not_cached_until_parent_appears() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        let parent_dir = sessions.join("2026/07/14");
+        let child_dir = sessions.join("2026/07/15");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let child = child_dir
+            .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl");
+        // Child replays the parent's total=100 and total=600 snapshots, then does one new
+        // turn (total=750). With the parent absent the replay is counted via the guessed
+        // baseline; with the parent present only the +150 turn should remain.
+        std::fs::write(
+            &child,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // Parent not yet on disk: fork is unresolved, so nothing is cached for it. Had the
+        // guessed result been cached, the next scan would serve it and double-count the 500
+        // replayed tokens on top of the parent's own count.
+        scan_usage(&query).expect("scan without parent");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cached files");
+        assert_eq!(cached_files, 0, "unresolved fork must not be cached");
+
+        // Parent appears; the child file is byte-for-byte unchanged. Because the unresolved
+        // result was never cached, this scan re-parses and resolves the baseline.
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::write(
+            parent_dir
+                .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+
+        let after = scan_usage(&query).expect("scan with parent");
+
+        // Parent contributes 100 + 500; child only its new +150 turn.
+        assert_eq!(after.total_tokens, 750);
+        let child_after: u64 = after
+            .details
+            .iter()
+            .filter(|event| {
+                event
+                    .source_path
+                    .contains("019f0000-0000-7000-8000-000000000002")
+            })
+            .map(|event| event.tokens.total())
+            .sum();
+        assert_eq!(child_after, 150);
+    }
+
+    #[test]
+    fn codex_nested_thread_spawn_parent_is_resolved() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        std::fs::write(
+            parent_dir
+                .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+        // The parent link is only present in the nested subagent thread_spawn shape.
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019f0000-0000-7000-8000-000000000001"}}},"cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write nested fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let report = scan_usage(&query).expect("scan usage");
+
+        // Parent 100 + 500; child replays both and adds only its 150 turn.
+        assert_eq!(report.total_tokens, 750);
+        let child: u64 = report
+            .details
+            .iter()
+            .filter(|event| {
+                event
+                    .source_path
+                    .contains("019f0000-0000-7000-8000-000000000002")
+            })
+            .map(|event| event.tokens.total())
+            .sum();
+        assert_eq!(child, 150);
+    }
+
+    #[test]
+    fn codex_fork_merges_snapshots_from_duplicate_parent_copies() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The parent session exists in two roots: an archived copy truncated to the first
+        // snapshot, and an active copy with the full pre-fork history. The child must inherit
+        // the merged (fuller) baseline, not whichever copy is indexed first.
+        let archived_dir = tmp.path().join("archived_sessions/2026/07/14");
+        let active_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&archived_dir).expect("create archived dir");
+        std::fs::create_dir_all(&active_dir).expect("create active dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent_name = "rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl";
+        std::fs::write(
+            archived_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write archived parent copy");
+        std::fs::write(
+            active_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write active parent copy");
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let report = scan_usage(&query).expect("scan usage");
+
+        // The child replays both parent snapshots (100 and 600) and adds only its 150 turn.
+        // Had it inherited from the truncated archived copy alone, the 500 would recount.
+        let child: u64 = report
+            .details
+            .iter()
+            .filter(|event| {
+                event
+                    .source_path
+                    .contains("019f0000-0000-7000-8000-000000000002")
+            })
+            .map(|event| event.tokens.total())
+            .sum();
+        assert_eq!(child, 150);
+    }
+
+    #[test]
+    fn codex_fork_reparses_when_a_new_parent_copy_appears() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let active_dir = tmp.path().join("sessions/2026/07/14");
+        let archived_dir = tmp.path().join("archived_sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&active_dir).expect("create active dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent_name = "rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl";
+        // At first only a truncated parent copy exists (just the total=100 snapshot).
+        std::fs::write(
+            active_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write truncated parent copy");
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // First scan: the only parent copy is truncated, so the child treats the not-yet-seen
+        // total=600 snapshot as new. The child is cached with a dependency on that one copy.
+        let before = scan_usage(&query).expect("first scan");
+        assert_eq!(before.total_tokens, 750);
+
+        // A fuller parent copy lands at a new (archived) path. The originally recorded copy is
+        // untouched, so only the changed candidate set can trigger the child to re-parse.
+        std::fs::create_dir_all(&archived_dir).expect("create archived dir");
+        std::fs::write(
+            archived_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fuller parent copy");
+
+        let after = scan_usage(&query).expect("second scan");
+
+        // Without candidate-set invalidation the child would stay cached and the fuller copy's
+        // 500 would be counted twice (total 1250); re-parsing merges both copies and keeps 750.
+        assert_eq!(after.total_tokens, 750);
+    }
+
+    #[test]
+    fn codex_fork_reparses_when_partial_parent_is_extended() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent = parent_dir
+            .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl");
+        // Parent is only partially synced: it has the total=100 snapshot but not yet the
+        // total=600 snapshot the child replays.
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write partial parent");
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // Partial parent: it emits only 100, and the child counts the not-yet-synced
+        // total=600 snapshot as new (its baseline is the partial 100). The child result is
+        // cached against the parent's current metadata.
+        let partial = scan_usage(&query).expect("scan with partial parent");
+        assert_eq!(partial.total_tokens, 750);
+
+        // Parent finishes syncing the total=600 snapshot. The child file is unchanged, but
+        // its cached dependency on the parent is now stale, so it must re-parse.
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("extend parent");
+
+        let extended = scan_usage(&query).expect("scan with extended parent");
+
+        // Without dependency invalidation the child would stay cached and the parent's newly
+        // synced 500 would be counted twice (total 1250); re-parsing keeps it at 750.
+        assert_eq!(extended.total_tokens, 750);
     }
 }

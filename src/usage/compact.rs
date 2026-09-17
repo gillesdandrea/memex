@@ -7,17 +7,17 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-pub(super) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
+pub(crate) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct StringId(NonZeroUsize);
 
-pub(super) enum UsageAssembly {
+pub(crate) enum UsageAssembly {
     Owned(Vec<UsageEvent>),
     Compact(CompactUsageAssembly),
 }
 
-pub(super) struct FilterFields<'a> {
+pub(crate) struct FilterFields<'a> {
     pub source: &'static str,
     pub permission_review: bool,
     pub project: Option<&'a str>,
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn repeated_text_is_stored_once_across_fields_and_events() {
-        let event = super::super::tests::cache_event("same", 1, "same", 10, 0, 0);
+        let event = super::super::cache_event("same", 1, "same", 10, 0, 0);
         let assembly = CompactUsageAssembly::new(vec![event; 100], None);
         assert_eq!(assembly.ends.len(), 3); // path, "same", provider
         assert_eq!(
@@ -323,13 +323,13 @@ mod tests {
 
     #[test]
     fn refresh_reuses_storage_and_replaces_events_without_stale_text() {
-        let event = super::super::tests::cache_event("old", 1, "same", 10, 0, 0);
+        let event = super::super::cache_event("old", 1, "same", 10, 0, 0);
         let mut assembly = CompactUsageAssembly::new(vec![event; 100], None);
         let event_buffer = assembly.events.as_ptr();
         let text_buffer = assembly.text.as_ptr();
         let offset_buffer = assembly.ends.as_ptr();
         for timestamp in 2..22 {
-            let mut updated = super::super::tests::cache_event("new", timestamp, "diff", 20, 0, 0);
+            let mut updated = super::super::cache_event("new", timestamp, "diff", 20, 0, 0);
             updated.permission_review = true;
             assembly = CompactUsageAssembly::new(vec![updated.clone(); 100], Some(assembly));
             assert_eq!(assembly.events.as_ptr(), event_buffer);
@@ -343,7 +343,7 @@ mod tests {
             assert!(assembly.view(99).permission_review);
         }
 
-        let grown = super::super::tests::cache_event("bigger", 22, "same", 30, 0, 0);
+        let grown = super::super::cache_event("bigger", 22, "same", 30, 0, 0);
         assembly = CompactUsageAssembly::new(vec![grown.clone(); 101], Some(assembly));
         assert_eq!(assembly.events.len(), 101);
         assert_eq!(
@@ -356,6 +356,14 @@ mod tests {
         assert!(assembly.text.is_empty());
         assert!(assembly.ends.is_empty());
         assert!(assembly.details(0..0).is_empty());
+    }
+
+    #[test]
+    fn openai_cached_input_is_a_subset() {
+        let tokens = TokenBuckets::codex(100, 80, 10, 4);
+        assert_eq!(tokens.uncached_input, 20);
+        assert_eq!(tokens.cache_read, 80);
+        assert_eq!(tokens.additive_total(), 110);
     }
 }
 
