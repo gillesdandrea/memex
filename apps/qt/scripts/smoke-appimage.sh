@@ -65,6 +65,12 @@ if [[ $code -ne 124 ]]; then
     tail -n 50 "$work/direct.log" >&2 || true
     echo '--- bundled linkage (missing entries) ---' >&2
     LD_LIBRARY_PATH="$root/usr/lib" ldd "$root/usr/bin/memex-qt" 2>&1 | grep 'not found' >&2 || true
+    echo '--- AppRun target, rpath, Qt resolution, plugin layout ---' >&2
+    ls -la "$root/AppRun" >&2
+    readelf -d "$root/usr/bin/memex-qt" 2>&1 | grep -Ei 'rpath|runpath' >&2 || echo '(no rpath/runpath)' >&2
+    LD_LIBRARY_PATH="$root/usr/lib" ldd "$root/usr/bin/memex-qt" 2>&1 | grep -Ei 'libQt6(Core|Gui|Qml|Quick)|libstdc\+\+|libc\.so' >&2 || true
+    ls "$root/usr/plugins/platforms/" >&2
+    cat "$root/usr/bin/qt.conf" >&2 || echo '(no qt.conf)' >&2
     exit 1
 fi
 if grep -Ei 'module ".*" is not installed|QQmlApplicationEngine failed|Could not load the Qt platform plugin' "$work/boot.log"; then
